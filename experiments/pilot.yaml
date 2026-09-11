@@ -1,0 +1,56 @@
+# Pilot study: simulated sweep of every code configuration against each
+# degradation independently. Run with:
+#   python -m prism_share.sim.pilot --config experiments/pilot.yaml
+#
+# Severity units are defined in prism_share/sim/degrade.py (SEVERITY_UNITS).
+# Every configuration is also decoded undegraded ("clean").
+
+seed: 0                   # CodecParams.seed of every configuration
+frames_per_condition: 4   # encoded frames per configuration; each is degraded and decoded once per condition
+colour_depths: [1, 2, 4, 8, 16]
+cell_px: [4, 5, 6, 8, 10]
+
+# Codeword lengths over which ecc_sim searches for the goodput-maximising k.
+ecc_lengths: [155, 255]
+
+# Decoder variants (DecoderOptions). Each degraded frame is decoded by each.
+decoders:
+  - {shape_channel: max,  colour_estimator: mean}
+  - {shape_channel: max,  colour_estimator: saturated}
+  - {shape_channel: luma, colour_estimator: mean}
+  - {shape_channel: luma, colour_estimator: saturated}
+
+# The decoder whose results the headline tables and figures report.
+# Chosen from the ablation: smallest total goodput loss against the best decoder
+# in each condition (see docs/pilot.md, "Decoder ablation").
+headline_decoder: {shape_channel: luma, colour_estimator: saturated}
+
+series:
+  - name: blur
+    degradation: blur
+    severities: [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  - name: noise
+    degradation: noise
+    severities: [10, 20, 40, 60, 80]
+  - name: perspective
+    degradation: perspective
+    severities: [0.05, 0.1, 0.15, 0.2, 0.3]
+  - name: white_balance
+    degradation: white_balance
+    severities: [0.5, 1.0, 2.0, 3.0, 4.0]
+  - name: chroma_nearest
+    degradation: chroma
+    options: {matrix: bt601, full_range: false, upsample: nearest}
+    severities: [1, 1.5, 2, 3, 4]
+  - name: chroma_bilinear
+    degradation: chroma
+    options: {matrix: bt601, full_range: false, upsample: bilinear}
+    severities: [1, 1.5, 2, 3, 4]
+  - name: chroma_bt709_nearest
+    degradation: chroma
+    options: {matrix: bt709, full_range: false, upsample: nearest}
+    severities: [2]
+  - name: chroma_bt709_bilinear
+    degradation: chroma
+    options: {matrix: bt709, full_range: false, upsample: bilinear}
+    severities: [2]
