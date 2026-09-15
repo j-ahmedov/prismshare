@@ -72,15 +72,46 @@ def test_frame_symbols_round_trip() -> None:
     assert result.ok and result.header == header and result.block == block
 
 
-def test_symbol_errors_within_rs_bound_are_corrected() -> None:
-    p = CodecParams()
-    header, block = _frame(p)
-    g, c = framing.encode_frame_symbols(header, block, p)
-    # Corrupt one cell in every 40: well under t = 15 byte errors per codeword.
-    g = g.copy()
-    g[::40] ^= 1
-    result = framing.decode_frame_symbols(g, c, p)
-    assert result.ok and result.block == block
+BOUNDARY_PARAMS = [
+    CodecParams(),  # RS(155,125), t = 15
+    CodecParams(colour_depth=16, cell_px=4, ecc_total=255, ecc_data=223),  # t = 16, many codewords
+    CodecParams(colour_depth=1, cell_px=10, ecc_total=63, ecc_data=41),  # t = 11, short codewords
+]
+
+
+def _corrupt_per_codeword(params: CodecParams, errors: int) -> tuple[np.ndarray, np.ndarray, bytes]:
+    """Encode a frame, then corrupt exactly ``errors`` distinct symbols in EVERY codeword.
+
+    Works on the stream bytes, where RS symbols live, so the count is exact
+    whatever the cell size, colour depth or frame capacity.
+    """
+    header, block = _frame(params)
+    g, c = framing.encode_frame_symbols(header, block, params)
+    cap = framing.frame_capacity(params)
+    stream = bytearray(framing.symbols_to_stream(g, c, params))
+    positions = framing.codeword_stream_positions(cap.n_codewords, params.ecc_total)
+    rng = np.random.default_rng(errors)
+    for row in positions:
+        for p in rng.choice(row, size=errors, replace=False):
+            stream[int(p)] ^= 0xFF  # a non-zero change: always a symbol error
+    g2, c2 = framing.stream_to_symbols(bytes(stream), params)
+    return g2, c2, block
+
+
+@pytest.mark.parametrize("params", BOUNDARY_PARAMS, ids=lambda p: p.label)
+def test_rs_corrects_exactly_t_errors_in_every_codeword(params: CodecParams) -> None:
+    """(n - k) // 2 symbol errors per codeword: the guarantee, at its boundary."""
+    g, c, block = _corrupt_per_codeword(params, params.ecc_correctable)
+    result = framing.decode_frame_symbols(g, c, params)
+    assert result.ok and result.block == block and result.codewords_failed == 0
+
+
+@pytest.mark.parametrize("params", BOUNDARY_PARAMS, ids=lambda p: p.label)
+def test_rs_fails_at_t_plus_one_errors_in_every_codeword(params: CodecParams) -> None:
+    """One symbol past the guarantee in every codeword: the frame must not come back."""
+    g, c, _ = _corrupt_per_codeword(params, params.ecc_correctable + 1)
+    result = framing.decode_frame_symbols(g, c, params)
+    assert not result.ok and result.block is None
 
 
 def test_heavy_corruption_fails_cleanly() -> None:

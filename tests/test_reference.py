@@ -18,15 +18,22 @@ from prism_share.codec.params import (
     CodecParams,
 )
 from prism_share.colourspace import mean_linear_luminance
+from prism_share.codec.decoder import read_index_band
+from prism_share.codec.params import INDEX_BAND_REFERENCE
 from prism_share.transmit.reference import bayer_matrix, configuration_luminance, reference_frame
 
 FRAME_PX = CodecParams().frame_px
 # Pinned: the reference must be identical for every run. A change invalidates the control.
-REFERENCE_PNG_SHA256 = "d1cd302a0951fbf576967e7cc4817f53787d096c34d4e07c73596e294f344020"
+REFERENCE_PNG_SHA256 = "322716f2e84add09c510c9a6dd289027c93de3722b994414a7b43eeedffaaddc"
 
 
 def test_reference_is_pinned() -> None:
     assert hashlib.sha256(png_bytes(reference_frame(FRAME_PX))).hexdigest() == REFERENCE_PNG_SHA256
+
+
+def test_reference_carries_the_reserved_index() -> None:
+    """Index 0 marks the reference structurally: no capture has to be recognised by its appearance."""
+    assert read_index_band(reference_frame(FRAME_PX), CodecParams()).index == INDEX_BAND_REFERENCE
 
 
 def test_reference_is_deterministic_across_calls() -> None:
@@ -62,6 +69,13 @@ def test_reference_features_are_whole_blocks() -> None:
     b = REFERENCE_DITHER_BLOCK_PX
     blocks = ref.reshape(FRAME_PX // b, b, FRAME_PX // b, b)
     assert (blocks.min(axis=(1, 3)) == blocks.max(axis=(1, 3))).all()
+
+
+def test_reference_leaves_the_index_band_alone() -> None:
+    """The dither may not spill into the reserved band (index 0 is all-black there)."""
+    from prism_share.codec.layout import index_band_mask
+
+    assert (reference_frame(FRAME_PX)[index_band_mask(FRAME_PX)] == 0).all()
 
 
 def test_bayer_matrix() -> None:

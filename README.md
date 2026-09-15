@@ -15,10 +15,16 @@ reproducibility and easy parameterisation. Runtime speed is not a goal.
 
 > **Status:** build steps 1–4 are complete: the codec (1–2), synthetic
 > degradations with a simulated pilot study (3, see [docs/pilot.md](docs/pilot.md)),
-> and the transmitter with its reference frame (4). Detection, ingest, the
-> capture sweep and the dashboard (5–7) are not built yet. Parts of step 6
-> (`analysis/metrics.py`, `analysis/ecc_sim.py`, `analysis/plots.py`) exist
-> because the pilot needed them.
+> and the transmitter with its reference frame (4). Ingest (5b) implements
+> [docs/capture-format.md](docs/capture-format.md) and its six rules; the
+> captured-data sweep, three-outcome yield and provenance-stamped figures (6)
+> are built. Of step 5a, the lens-independent geometry is built; the fiducial
+> front end (which image regions are markers under a real lens) is an interface
+> that raises `NotImplementedError` until real captures exist, so **no real
+> capture can be processed yet**. The dashboard (7) is not started.
+>
+> **Frame format 2 (2026-09-12)** adds the index band, so frames drawn before it
+> are not interchangeable with frames drawn after: see §3.1.
 
 ---
 
@@ -70,12 +76,21 @@ prism_share/
     metrics.py    shape SER, colour SER, byte errors, goodput formula
     ecc_sim.py    any RS(n, k) from a recorded byte error pattern
     plots.py      thesis figures (vector PDF + SVG)
+    detect.py     fiducial refinement, homography, rectification at scale k, flat field, overlay
+    sweep.py      ingested runs -> per-frame and per-run tables (Parquet), three-outcome yield
+  ingest/
+    manifest.py   the capture contract: manifest.json + frames.jsonl, schema version 1
+    rundef.py     laptop-side run definitions (experiments/runs/<run_id>.yaml)
+    ingest.py     the six rules; loading Y/U/V/RGB planes; merge with detection
+    pull.py       adb pull wrapper
   transmit/
     display.py    fullscreen player, calibration patches, screenshot verification
     reference.py  the reference frame the capture app locks onto
+  export/
+    bench.py      decode-benchmark bundle (frames + self-describing ground truth) for the Android spike
 tests/
-experiments/      YAML run definitions (pilot.yaml)
-docs/             pilot report and figures, reference-frame luminance table
+experiments/      pilot.yaml; runs/<run_id>.yaml laptop-side run definitions
+docs/             capture-format.md (the phone contract), pilot report, reference-frame table
 data/             captures, generated frames, logs (gitignored)
 ```
 
@@ -122,6 +137,10 @@ These are held constant across the whole experiment. All of them are in
 | `FIDUCIAL_MODULE_PX` | 12 | Marker = 6×6 modules = 72 px. |
 | `FIDUCIAL_MARGIN_PX` | 12 | White between marker and data (≥ 1 module, as ArUco requires). |
 | `KEEPOUT_PX` | 100 | Corner square with no data: border + marker + margin. |
+| `FRAME_FORMAT_VERSION` | 2 | Pixel layout of a frame. Enters the fingerprint, so formats cannot be mixed. |
+| `INDEX_BAND_BITS`, `_REPEATS` | 8, 3 | Frame index, repeated for a majority vote (§3.1). |
+| `INDEX_BAND_BLOCK_PX` | 32 | Block side: far larger than any data cell, so the band reads at every configuration. |
+| `INDEX_BAND_REFERENCE` | 0 | Index reserved for the reference frame. |
 | `BACKGROUND_RGB` | (0, 0, 0) | Data region is dark, like cimbar's dark mode. |
 | `MONO_INK_RGB` | (255, 255, 255) | Ink for colour_depth = 1. |
 | `PALETTE_LEVELS` | 0, 128, 255 | Per-channel code values palette candidates may use. |
@@ -133,12 +152,16 @@ These are held constant across the whole experiment. All of them are in
 | `CRC_FORMAT` | `>I` | CRC-32 over header + block. |
 | `FOUNTAIN_REPAIR_FRACTION`, `_MIN_REPAIR` | 0.25, 4 | Default number of repair frames. |
 | `ASSUMED_FPS` | 30 | Frame rate in the goodput formula. Never measured. |
+| `RS_SELECTION_PERIOD` | 2 | Even frame positions choose the RS code, odd positions score it (§10.1). |
 | `YUV_DEFAULT_MATRIX` | `bt601` | Y′CbCr matrix of simulated YUV_420_888 (BT.709 selectable). |
 | `YUV_LIMITED_*`, `YUV_C_OFFSET` | 16, 219, 224, 128 | 8-bit limited-range Y′CbCr. |
 | `YUV_420_FACTOR` | 2 | Chroma subsampling per axis in YUV_420_888. |
 | `DECODER_LUMA_MATRIX` | `bt601` | Luma used by the `luma` shape channel. |
 | `COLOUR_CORE_FRACTION` | 0.25 | Share of ink pixels averaged by the `saturated` colour estimator. |
-| `REFERENCE_TARGET_LINEAR_MEAN` | 0.312 | Reference frame's whole-frame mean linear luminance (see §14). |
+| `HEADLINE_SHAPE_CHANNEL`, `_COLOUR_ESTIMATOR` | `luma`, `saturated` | Pre-registered headline decoder (§8.1); the rest are sensitivity analysis. |
+| `HEADLINE_DECODER_REGISTERED` | 2026-09-14 | Date of that pre-registration, before any real capture. |
+| `NEAR_TIE_MARGIN_PCT` | 5.0 | A winner ahead of the other class by less than this is flagged as a near-tie. |
+| `REFERENCE_TARGET_LINEAR_MEAN` | 0.308 | Reference frame's whole-frame mean linear luminance (see §14). |
 | `REFERENCE_DITHER_SIZE`, `_BLOCK_PX` | 16, 2 | Bayer matrix side; screen pixels per dither element. |
 | `DISPLAY_SURROUND_RGB` | (0, 0, 0) | Screen outside the frame, for every configuration. |
 | `DISPLAY_DEFAULT_INTERVAL_MS` | 200 | Free-running time per frame. |
@@ -151,7 +174,8 @@ A frame is a `frame_px × frame_px` RGB image (origin top-left, x right, y down)
 1. **White border**, `BORDER_PX` wide, all round.
 2. **Four keep-out squares** (`KEEPOUT_PX`) at the corners. Each is white and
    holds an ArUco marker (black on white) at offset `BORDER_PX` from both edges.
-3. **Data region**: everything else. Black background with the cell grid.
+3. **The index band** (§3.1), between the two top keep-out squares.
+4. **Data region**: everything else. Black background with the cell grid.
 
 **Static region invariance (hard requirement 1).** The border band and the
 keep-out squares make up the *static region*. It depends on `frame_px` only:
@@ -170,6 +194,76 @@ confounded, and this invariance rules that out. It is enforced three ways:
 What the fiducials *cannot* hold constant is the image content next to the
 keep-out margin: blur can carry data-region light into the margin. The 12 px
 margin is chosen to be several blur widths.
+
+### 3.1 The index band: every frame says which frame it is
+
+A reserved horizontal band of large black-and-white blocks carries an 8-bit
+**frame index**. Index 0 is the reference frame; code frames are 1 upward.
+
+| Property | Value |
+|---|---|
+| Blocks | 24 = 8 bits × 3 repeats, majority vote on read |
+| Block size | 32 × 32 px (every data cell is 4–10 px) |
+| Position | x 128–896, y 24–56; centred between the top keep-out squares |
+| Area | 768 × 32 px = 24 576 px², 2.34 % of the frame |
+| Colour | pure black and white only, at every colour depth |
+
+Its **geometry is constant for every configuration**, exactly like the
+fiducials; only the index changes what it says. It is read after rectification,
+from the same normalised levels the decoder uses, and it is unaffected by
+colour depth or cell size because its blocks are an order of magnitude larger
+than any cell.
+
+**Why the frame carries its own identity.** The alternative, working out which
+displayed frame a capture shows by seeing which one it decodes closest to,
+makes identification depend on decode quality, which is the thing being
+measured. A badly degraded capture is exactly the one that fails to identify
+and gets excluded, so exclusion correlates with the outcome: configurations
+that degrade more lose more frames, and their surviving frames are their
+easiest ones. That compresses the measured difference between configurations
+by a configuration-dependent amount. The band removes the question: it is
+readable in every case where detection succeeded at all, and when detection
+fails the frame is already counted as "detection failed" and needs no ground
+truth. There is deliberately **no content-matching fallback**: a fallback would
+fire precisely on degraded frames, which is where the bias does its damage.
+
+The band costs a fixed area of cells:
+
+| cell_px | cells before | cells now | lost |
+|---|---|---|---|
+| 4 | 38 048 | 36 970 | 1 078 (2.83 %) |
+| 5 | 26 441 | 25 667 | 774 (2.93 %) |
+| 6 | 19 305 | 18 639 | 666 (3.45 %) |
+| 8 | 11 700 | 11 270 | 430 (3.68 %) |
+| 10 | 7 844 | 7 564 | 280 (3.57 %) |
+
+The index wraps after 255, because a real payload can need thousands of
+frames. A measurement run displays exactly one frame (§13), so the wrap never
+matters there.
+
+**The band is apparatus, not codec.** A deployed system would carry its frame
+index in the fountain header, not in a 768 × 32 px strip. Because the band's
+cell cost varies with cell_px (2.83 % at 4 px, 3.57 % at 10 px), it would
+enter the between-configuration comparison as a term that is not physics. Every
+goodput from captured data is therefore reported twice (§17): as measured, and
+with the band's cells credited back.
+
+**Known failure mode: a horizontal artefact across y 24–56.** All three copies
+of the index sit in the same rows. A horizontal artefact over those rows, such
+as glare across the top of the panel or a rolling-shutter dark band, takes out
+all three at once, so the majority vote cannot save the read. This is accepted
+deliberately. Within a run the geometry is locked, so such an artefact repeats
+on every capture: it kills the whole run loudly (`band_agreement` drops and
+captures stop matching the run's frame) rather than biasing it quietly.
+**Diagnosis:** an artefact tied to the rig, not the code. **Fix:** change the
+phone's angle or the lighting, and repeat the run.
+
+**Frame format version.** `FRAME_FORMAT_VERSION` (now 2) enters
+`CodecParams.fingerprint()`, which every frame carries in its header. A capture
+of a format-1 frame (no index band) therefore fails the fingerprint check
+instead of being decoded with today's geometry: **old and new captures cannot
+be silently mixed.** Any run captured before 2026-09-12 must be recaptured, and
+its frames regenerated with `display frames`.
 
 **Cell grid.** The pitch is `cell_px + cell_gap_px`. The number of cells per
 side is the largest count that fits inside the border with at least
@@ -228,7 +322,9 @@ Ink colours are drawn on the black background.
   candidate colours: RGB triples over {0, 128, 255} with at least one channel at
   255 (19 candidates). Requiring a full-scale channel gives every palette colour
   the same HSV value, so every colour has the same shape contrast against
-  black, measured the way the decoder measures it (per-pixel channel maximum).
+  black, measured the way the `max` shape channel measures it (per-pixel channel
+  maximum). The pre-registered headline reads shape from luma instead, where the
+  contrast is not equal. §8.1 states that cost.
 * **Objective** (lexicographic, exact integer arithmetic): (1) maximise the
   minimum pairwise Euclidean distance in 8-bit code values; (2) maximise the
   minimum Rec. 709 luma (sensor SNR); (3) minimise the number of pairs at the
@@ -280,11 +376,11 @@ CRC, RS parity and padding. At the default RS(155, 125):
 
 | cell_px | depth 1 | depth 2 | depth 4 | depth 8 | depth 16 |
 |---|---|---|---|---|---|
-| 4 | 15 230 B | 19 105 B | 22 980 B | 26 730 B | 30 605 B |
-| 5 | 10 605 B | 13 230 B | 15 855 B | 18 605 B | 21 230 B |
-| 6 | 7 730 B | 9 605 B | 11 605 B | 13 480 B | 15 480 B |
-| 8 | 4 605 B | 5 855 B | 6 980 B | 8 230 B | 9 355 B |
-| 10 | 3 105 B | 3 855 B | 4 605 B | 5 480 B | 6 230 B |
+| 4 | 14 855 B | 18 605 B | 22 230 B | 25 980 B | 29 730 B |
+| 5 | 10 230 B | 12 855 B | 15 480 B | 17 980 B | 20 605 B |
+| 6 | 7 480 B | 9 355 B | 11 230 B | 13 105 B | 14 980 B |
+| 8 | 4 480 B | 5 605 B | 6 730 B | 7 855 B | 8 980 B |
+| 10 | 2 980 B | 3 730 B | 4 480 B | 5 230 B | 5 980 B |
 
 This is the *ceiling* (frame yield = 1). For example, monochrome at 4 px already
 has 2.2× the raw capacity of the cimbar-like 4-colour 8 px code. Whether that
@@ -333,19 +429,101 @@ Because colour never uses the decoded glyph, the decoder cannot turn a shape
 error into a colour error or the reverse. Shape SER and colour SER (step 6)
 therefore measure separate physical effects (hard requirement 6).
 
-**Decoder variants** (`DecoderOptions`). The pilot study compares four:
+**Decoder variants** (`DecoderOptions`). Every analysis decodes with all four:
 
-* shape channel `max` (default, as above) or `luma`, which reads shape, and
-  ranks ink pixels, from Y′ (BT.601) of the normalised RGB;
-* colour estimator `mean` (default, as above) or `saturated`, which averages
-  only the most saturated `COLOUR_CORE_FRACTION` (¼) of the ink pixels.
+* shape channel `max` (as above) or `luma`, which reads shape, and ranks ink
+  pixels, from Y′ (BT.601) of the normalised RGB;
+* colour estimator `mean` (as above) or `saturated`, which averages only the
+  most saturated `COLOUR_CORE_FRACTION` (¼) of the ink pixels.
 
-No variant is best everywhere. `luma` is immune to chroma subsampling but weak
-for dark-luma inks (pure blue) under noise and blur. `saturated` cuts colour
-SER 1.8–6.7× under 4:2:0, but is far worse under strong noise. The codec
-default is unchanged (`max`/`mean`). The pilot reports `luma`/`saturated` as its
-headline because it has the smallest total loss; see
-[docs/pilot.md](docs/pilot.md#decoder-ablation).
+`DecoderOptions()` with no arguments is still `max`/`mean`, the plain reference
+decoder described above. No analysis uses that default implicitly: the pilot
+and the sweep both iterate over `decoder.ALL_DECODERS`, headline first.
+
+### 8.1 Pre-registered headline decoder: `luma`/`saturated`
+
+**Every headline number, table and figure uses `luma`/`saturated`. The other
+three variants are reported alongside it, everywhere, as sensitivity analysis.**
+The choice is fixed in `params.py` (`HEADLINE_SHAPE_CHANNEL`,
+`HEADLINE_COLOUR_ESTIMATOR`, `HEADLINE_DECODER_REGISTERED = 2026-09-14`). It is
+exported as `decoder.HEADLINE_DECODER`, and no experiment file can override it:
+`sim.pilot.load_config` rejects a `headline_decoder` key.
+
+**Provenance, stated plainly.** This variant was first picked *after* the
+4-frame pilot, because it had the smallest total goodput loss in the decoder
+ablation. That is a post-hoc choice. It is pre-registered now, on 2026-09-14,
+before any real capture exists. The pilot numbers are **not** the
+justification. The justification is the argument below, which would hold
+whatever the pilot had said, and the headline will not be changed after real
+captures are seen.
+
+The guiding principle is the same as for the palettes (§5). The hypothesis
+predicts that colour loses. A fair test must therefore give colour its best
+chance, and it must not handicap colour through a decoder that ignores how the
+camera actually delivers pixels. The decoder choice cannot move monochrome: a
+white-on-black cell has equal channels, so its luma and its channel maximum
+are the same signal, and monochrome makes no colour decision. Only colour
+goodput depends on this choice.
+
+**Why `luma` for shape.**
+
+1. **It reads shape where the camera keeps shape.** The capture format is
+   `YUV_420_888`, and JPEG is also Y′CbCr with subsampled chroma. Y is the only
+   full-resolution plane. U and V have one sample per 2×2 pixels, so any
+   spatial detail finer than that exists only in Y. Every RGB triple, the
+   phone's or ours, is Y plus upsampled chroma. Its channel maximum therefore
+   mixes chroma interpolation into glyph edges, and that happens on every
+   capture, not only under a bad condition. A glyph is spatial detail at 4–10
+   px, so shape should come from the plane that carries spatial detail.
+2. **It keeps the error decomposition and the mechanism experiment clean.**
+   Y is the same, up to rounding, in the phone's RGB and in our
+   `yuv_nearest` / `yuv_bilinear` conversions. So under `luma`, shape SER is
+   essentially identical across pixel sources, and any difference between
+   sources lands in colour SER. The mechanism experiment (native U/V planes vs
+   the phone's upsampled RGB) then compares colour alone, which is exactly
+   what it is for. Under `max`, the shape reading would change with the chroma
+   upsampler, and the comparison would mix shape and colour effects (hard
+   requirement 6).
+3. **Its cost is known and named.** A low-luma ink (pure blue, Y′ = 0.114) has
+   about one ninth of the channel-maximum contrast in luma. It is therefore the
+   first to lose shape under noise and blur. The palette rule's criterion (2)
+   (maximise the minimum luma) exists because of this, but it is only a
+   tie-break after colour distance, so the 4-colour palette still contains
+   pure blue. This cost falls on colour, against the hypothesis's favoured
+   outcome. It is accepted because the alternative, reading shape through
+   chroma interpolation, costs colour on every capture and at every noise
+   level.
+
+**Why `saturated` for colour.**
+
+1. **4:2:0 dilutes chroma at every glyph edge, on every capture.** An ink pixel
+   whose 2×2 chroma block overlaps the black gap or background has its colour
+   pulled toward neutral. Ink pixels are spread across a 4–10 px cell, so a
+   large share of them are edge pixels. The interior pixels, whose chroma
+   block lies wholly in ink, are the most saturated ones. Averaging only those
+   estimates the colour that was displayed. Averaging all of them estimates
+   that colour mixed with black's chroma.
+2. **It does not depend on the shape decision.** It uses the same ink ranking
+   as `mean`, so colour SER still cannot inherit shape errors.
+3. **Its cost is also known and named.** Selecting the most saturated pixels
+   under heavy noise selects noise excursions, and averaging a quarter of the
+   ink uses fewer pixels. At low noise that cost is small. At high noise it can
+   exceed the dilution it corrects. Real sensor noise on a bright, static,
+   close-range screen is expected to be low, but that is an expectation, not a
+   measurement. If captures turn out noisy, the `mean` rows of the sensitivity
+   analysis show it. The headline is not switched.
+
+**Would another default be better?** `max`/`saturated` is the strongest
+alternative, because the palettes' full-value constraint gives every colour
+equal channel-maximum contrast. It is rejected on reason 2 for `luma`: it makes
+shape SER depend on the chroma path, and so confounds the one experiment
+designed to isolate the chroma path. The `mean` estimators are rejected on
+reason 1 for `saturated`: they ignore a dilution that 4:2:0 guarantees.
+
+`read_index_band(rectified, params)` reads the frame's own index from the band
+(§3.1) using the same normalised levels, and reports the majority-vote
+agreement and the smallest decision margin. It is what identifies a capture;
+nothing in the analysis matches captures against candidate frames by content.
 
 `decode_frame` adds RS error decoding, CRC and fingerprint checks.
 `framing.decode_frame_symbols(..., erased_cells=mask)` treats low-confidence
@@ -395,6 +573,43 @@ goodput = payload_bytes_per_frame × frame_yield × ASSUMED_FPS
 * The formula assumes an **ideal erasure code across frames**. The fountain
   code's reception overhead (a few frames per payload, see §7) is not charged.
 
+### 10.1 The RS code is chosen out of sample
+
+Hard requirement 5 lets every configuration use its goodput-maximising
+RS(*n*, *k*). Choosing that code on the same frames its goodput is then scored
+on is an **in-sample optimum**. It picks the code that happens to fit those
+frames' worst codewords, so it overstates goodput, and it does so most for
+configurations near their yield cliff. More frames dilute the bias; they do not
+remove it. On real captures, where 200 frames per condition is a lab day, it
+would be worse than in the pilot.
+
+So every reported goodput is **out of sample** (`ecc_sim.out_of_sample`):
+
+* **Split by position, fixed before analysis.** A frame is in the *selection*
+  half iff its position is even (`RS_SELECTION_PERIOD` = 2), otherwise in the
+  *evaluation* half. Position means the frame index in the pilot, and the
+  capture `index` from `frames.jsonl` for real captures. The rule looks at
+  position only, never at outcomes, so every configuration in a condition gets
+  the same split and comparisons stay paired.
+* **Interleaved, not first half / second half.** Slow drift over a run (panel
+  warm-up, room light) then lands in both halves equally, instead of
+  separating the frames the code was chosen on from the frames it is scored on.
+* **Chosen on selection, scored on evaluation.** RS(*n*, *k*) is chosen on the
+  selection half. Yield, the three-outcome counts and goodput are counted on
+  the evaluation half only. The fixed RS(155,125) columns are counted on the
+  evaluation half too, so every yield in a table uses the same frames. SERs are
+  not selected on anything and use all frames.
+* **No held-out frames, no number.** If either half is empty, `best_*` goodput
+  is NaN, never an in-sample value.
+
+In-sample selection remains available only to measure the bias. The pilot keeps
+`in_sample_goodput_mbps` and `evaluation_oracle_goodput_mbps` as labelled
+diagnostic columns and reports the gap. `sweep.py` refuses to produce in-sample
+goodput unless it is run with `--in-sample`. That flag prints a warning, raises
+`InSampleWarning` from `SweepConfig`, writes `rs_selection = in_sample` on every
+row, and stamps "IN-SAMPLE RS SELECTION (optimistic, not a result)" on every
+figure.
+
 ## 11. Synthetic degradations (build step 3)
 
 `sim/degrade.py`. Every degradation is a pure function
@@ -427,10 +642,17 @@ guarantees stable across versions. numpy's `Generator.normal` is avoided.
 degradation ladder in `experiments/pilot.yaml`, one degradation at a time, and
 writes [docs/pilot.md](docs/pilot.md) with tables, figures (`docs/pilot/*.pdf|svg`)
 and `docs/pilot/pilot_summary.csv`. The results are **simulated predictions,
-not measurements**. In short: with single degradations, a colour depth above 1
-maximises goodput in 33 of 34 conditions. Chroma subsampling is the only
-degradation that selectively harms colour, pushing the best depth down from 16
-to 2–4, and the optimal cell size is set by blur alone. The report lists what
+not measurements**. In short: at 200 frames per condition, with the
+pre-registered decoder (§8.1) and the RS code chosen out of sample (§10.1), a
+colour depth above 1 maximises goodput in 42 of 46 conditions (32 of the
+original 34, unchanged by out-of-sample scoring). Every winner is reported with
+its runner-up and margin, and the band-credited column gives the same winner in
+all 46. Chroma subsampling is the only degradation that selectively harms
+colour. On the chroma-pitch ladder (1 to 4 in steps as fine as 0.25), the best
+depth falls from 16 to 4, then 2, and monochrome wins from pitch 3.75. The
+crossing lies between 3.5 and 3.75 with `luma/saturated`, but at about 2.3–3.0
+with the `mean` colour estimators, the largest decoder sensitivity in the pilot.
+The optimal cell size is set almost entirely by blur. The report lists what
 the model leaves out: Bayer demosaicing, combined degradations, realistic noise
 and compression.
 
@@ -439,12 +661,34 @@ and compression.
 `transmit/display.py`:
 
 ```bash
-python -m prism_share.transmit.display frames --colour-depth 4 --cell-px 8 --payload-bytes 200000 --out data/runs/c4_px8
-python -m prism_share.transmit.display play data/runs/c4_px8 --reference     # free-running, opens with the reference frame
-python -m prism_share.transmit.display play data/runs/c4_px8 --hold          # single-frame hold, arrow keys step
-python -m prism_share.transmit.display calibrate                            # solid patches (add --auto to cycle)
+python -m prism_share.transmit.display frames --colour-depth 4 --cell-px 8 --payload-bytes 200000 --n-frames 5 --out data/runs/c4_px8
+python -m prism_share.ingest.rundef new --run-id d07_lux200_f0 --frames data/runs/c4_px8 --block 0 --condition distance_m=0.7
+python -m prism_share.transmit.display measure experiments/runs/d07_lux200_f0.yaml   # THE measurement path
+python -m prism_share.transmit.display play data/runs/c4_px8 --reference            # demonstrator only, never a measurement
+python -m prism_share.transmit.display calibrate                                   # solid patches (add --auto to cycle)
 python -m prism_share.transmit.display verify shot.png --frame data/runs/c4_px8/frame_00000.png
 ```
+
+**Measurement protocol: one run, one static frame.** A measurement run holds
+ONE frame on screen for the whole capture and never advances, so a capture
+cannot be torn between two frames: tearing is impossible rather than accounted
+for. Frame yield is the fraction of captures that are recoverable, and the
+variation between captures comes from the channel (noise, rolling-shutter
+phase, micro-motion), not from the stimulus changing. Content variation is
+covered by running several distinct frames per configuration, one per run
+(`--block 0`, `--block 1`, …). `display measure <run definition>` shows, in
+order, advancing only on → :
+
+1. the **reference frame**: lock AE, AF and AWB on it;
+2. the **brightest** code configuration: check clipping;
+3. the **darkest** code configuration: check clipping (the reference passing a
+   clip check proves neither extreme passes; they sit about ±0.5 stop from it);
+4. the **run's frame**, held while the phone captures. Nothing follows it, and
+   space never starts playback.
+
+`display play` remains as a free-running **demonstrator**. It warns on start,
+logs `measurement: false`, and nothing it shows is a valid capture for the
+sweep.
 
 * **Window:** a borderless fullscreen OpenCV HighGUI window. The buffer handed
   to it is always exactly the window size, so HighGUI has nothing to rescale.
@@ -463,7 +707,7 @@ python -m prism_share.transmit.display verify shot.png --frame data/runs/c4_px8/
 * **Timing:** the free-running interval (`--interval-ms`, default 200) follows a
   fixed schedule, so draw time does not accumulate. HighGUI gives no vsync
   guarantee, so actual times are logged. Timing never enters a result.
-* **Keys:** space play/pause, → ↓ next, ← ↑ previous, `r` reference, `q`/Esc quit.
+* **Keys:** space play/pause (ignored in `measure`), → ↓ next, ← ↑ previous, `r` reference, `q`/Esc quit.
 * **`frames`** writes a run's PNGs plus `frames.json` (params, fingerprint,
   payload source and per-frame hashes). By default the payload is the
   deterministic keystream, so ground truth can be regenerated.
@@ -479,7 +723,7 @@ picture processing. Before trusting a setup:
 1. set the display to its native resolution at 100 % scaling, and disable
    Night Shift, True Tone and auto-brightness (or the equivalents on other
    platforms);
-2. play a frame with `--hold`, take a lossless full-screen screenshot, and run
+2. show a frame (`measure`, or `play --hold`), take a lossless full-screen screenshot, and run
    `verify`. It locates the frame at an integer scale and requires **every
    pixel to match exactly**. It also reports whether a mismatch looks like
    colour management (small differences everywhere) or interpolated scaling
@@ -501,10 +745,10 @@ AF and AWB on it:
   *whole-frame mean linear luminance* (sRGB EOTF, Rec. 709 weights) reaches
   `REFERENCE_TARGET_LINEAR_MEAN`. Linear, because auto-exposure meters light,
   not code values: flat sRGB 128 is 0.216, while a 50/50 black/white pattern is 0.5.
-* **One reference for all runs, by design.** The code configurations span 0.218
-  (2 colours, 4 px) to 0.447 (mono, 10 px) linear, about one stop, so no single
+* **One reference for all runs, by design.** The code configurations span 0.217
+  (2 colours, 4 px) to 0.438 (mono, 10 px) linear, about one stop, so no single
   frame can match them all. The target is pinned at their geometric midpoint,
-  0.312, which limits the worst mismatch to ±0.53 stops and gives **every
+  0.308, which limits the worst mismatch to ±0.51 stops and gives **every
   configuration identical camera settings**. A per-configuration reference
   (`--match DEPTH,CELL_PX`) is available, but using it would tie exposure to the
   parameter under test.
@@ -512,6 +756,183 @@ AF and AWB on it:
   prints and records every configuration's mean linear luminance and its
   mismatch in stops ([docs/reference_frame.md](docs/reference_frame.md)). Its
   PNG hash is pinned by `tests/test_reference.py`.
+
+## 15. Detection and rectification (build step 5a, geometry half)
+
+`analysis/detect.py`: `detect(image, params, *, kernel, flat_field, front_end, k)`
+takes a captured frame (Y plane or RGB) and returns a `Detection`: the
+rectified array plus a flat `DetectionRecord`. Failure is returned, never
+raised.
+
+| Stage | Status |
+|---|---|
+| **Front end**: decide which regions are the four markers; return coarse outer corners (±2 px) | **Interface only** (`FrontEnd`, `FrontEndResult`); `locate_fiducials` raises `NotImplementedError`. To be designed on real captures. |
+| Sub-pixel refinement | Built. Edge profiles across each marker's outer square; gradient centroid around the 50 % crossing; TLS line per edge; corners = line intersections. |
+| Marker centres → homography | Built. Diagonal intersections; H from the four centre correspondences. |
+| Reprojection error | Built. Measured on the 16 marker corners, which the fit does not use (a four-point fit always has zero residual). |
+| Rectification | Built. Integer scale k ≥ the largest local magnification (never downsamples); kernel `nearest`, `bilinear` (default) or `lanczos`, recorded. The decoder infers k from the array shape and averages each k×k block. |
+| Flat field | Built, off by default. Local mean of the captured reference / local mean of the ideal dither, normalised. |
+| Record, overlay | Built. See `DetectionRecord`; `write_overlay` draws the frame outline, fiducial quad, refined marker outlines, cell grid and cell centres. |
+
+**One detector.** The detection constants (`REFINE_*`, `RECTIFY_*`,
+`FLAT_FIELD_*`) are single values in `params.py`, and refinement reads only the
+static region. `tests/test_detect.py` checks that refined corners are
+bit-identical across all 25 configurations for the same capture geometry.
+
+**Validation (synthetic, pure geometry).** A generated frame is imaged through a
+known homography (2× supersampled, area-averaged), and the front end is a stub
+returning the true corners ±2 px. Over magnifications of 0.8–3, oblique and
+rotated views, blur up to 1.5 px and noise up to 4 code values, the recovered
+homography matches to ≤ 0.06 source px across the whole code (the test asserts
+< 0.1 px), and symbols decode with zero errors where the pilot says they
+should.
+
+**Not yet validated:** anything lens-dependent. The model is a pure homography,
+so lens distortion inside the frame is not corrected. The 16-corner reprojection
+error exposes it only at the markers; look at the cell grid in the middle of the
+overlay on the first real capture.
+
+## 16. Ingest (build step 5b)
+
+Implements [docs/capture-format.md](docs/capture-format.md), schema version 1,
+field for field. `ingest/manifest.py` is the only module that knows the
+contract, and it adds no fields.
+
+```bash
+python -m prism_share.ingest.pull d07_a30_lux200_oled          # adb pull, then validate
+python -m prism_share.ingest.ingest data/d07_a30_lux200_oled   # validate and report (--detect needs the front end)
+```
+
+| Rule (from the contract) | Enforcement |
+|---|---|
+| 1. unknown `schema_version` | run rejected |
+| 2. no laptop-side run definition | run rejected; the message lists the known run ids, because `run_id` is typed by hand on the phone |
+| 3. tainted frames | dropped; count per `taint_reasons` value in the report and `ingest_report.json` |
+| 4. `frames.tainted / frames.written > 0.01` | run refused: "must be repeated" (exactly 1 % passes) |
+| 5. `written != requested` | warning |
+| 6. resolution, YUV matrix and range from the manifest | read, never assumed; every plane is checked against `capture_resolution`; values the contract does not define reject the run |
+
+Ingest also rejects files that break the contract: missing or mistyped
+fields, taint reasons outside the closed set, `tainted` inconsistent with
+`taint_reasons`, `frames.jsonl` counts that contradict the manifest, and
+and a `pixel_format` that is neither documented path. Files are always found
+through `file_stem`, never rebuilt from `index`.
+
+Where the contract is silent, ingest refuses rather than guessing:
+
+* **`yuv_matrix` / `yuv_range` values are not enumerated.** Only `BT601`,
+  `BT709`, `limited` and `full` are accepted.
+* **`capture_resolution` order is not stated.** It is read as [width, height]
+  (the Camera2 `Size` order) and verified against every PNG.
+* **Nothing marks reference-frame captures or says which code frame was on
+  screen.** Neither needs a field: every frame carries its own index band
+  (§3.1), and index 0 is the reference.
+
+`color.pixel_format` selects the path: `YUV_420_888` (Y, U, V and RGB PNGs) or
+`JPEG` (one `frame_NNNN.jpg` per frame, a comparison baseline that is never a
+headline measurement). Any other value rejects the run.
+
+**Laptop-side run definitions** (`ingest/rundef.py`). The contract makes
+`run_id` the join key with a laptop-side run definition, but does not define
+that file. It is defined here, and written by
+`python -m prism_share.ingest.rundef new`:
+
+```yaml
+# experiments/runs/<run_id>.yaml
+run_id: d07_a30_lux200_oled      # must equal manifest.json's run_id
+frames: data/runs/c4_px8          # folder written by `display frames` (frames.json)
+displayed: [3]                    # exactly ONE block_id: the static frame held for the whole capture
+condition: {distance_m: 0.7, illuminance_lux: 200, display: oled}
+clip_check:                       # shown by `display measure` right after locking
+  brightest: {colour_depth: 1, cell_px: 10, frames: data/clip_check/c1_px10, frame_mean_linear: 0.43751, stops_vs_reference: 0.506}
+  darkest:   {colour_depth: 4, cell_px: 4,  frames: data/clip_check/c4_px4,  frame_mean_linear: 0.21741, stops_vs_reference: -0.502}
+```
+
+One run holds one codec configuration and **one static frame**. Anything else
+in `displayed` (a list of several, `all`, nothing) rejects the run. The
+configuration and payload come from `frames.json`, so there is a single source
+of truth. On load, the frame's ground truth is regenerated and must reproduce
+the hash recorded at display time, which catches any change to the codec
+between display and analysis. A capture whose band names any other frame is
+counted as detected but not recoverable; it is never matched to ground truth,
+and never excluded.
+
+`clip_check` is required. `rundef new` fills it from the same linear-luminance
+table as [docs/reference_frame.md](docs/reference_frame.md), picking the
+brightest and darkest code configurations (currently mono at 10 px, +0.51
+stops, and 4 colours at 4 px, −0.50 stops; 2 colours at 4 px is within
+frame-to-frame spread of the darkest). It also writes one deterministic frame of
+each to `data/clip_check/`, shared by every run. A run id that already exists is
+never overwritten.
+
+## 17. Captured-data sweep and figures (build step 6)
+
+`analysis/sweep.py`:
+
+```bash
+python -m prism_share.analysis.sweep data/<run_id> ... --out data/sweep --figures docs/figures
+```
+
+For each run, in two passes:
+
+1. **Detect** every capture on its Y plane (the JPEG image on that path), then
+   read its **index band**. Index 0 means a capture of the reference frame:
+   those are excluded from yield and, with `--flat-field`, the first one
+   supplies the run's flat field.
+2. **Decode** every code capture from each pixel source with each decoder
+   variant, against the ground truth of the frame its band names. The sources
+   are: `y` (monochrome only), the phone's `rgb`, and our own `yuv_nearest` /
+   `yuv_bilinear` conversion of the native planes using the manifest's matrix
+   and range; on the JPEG path there is one source, `jpeg`. Detection geometry
+   is shared, so the sources differ only in their pixels.
+
+**The mechanism experiment** is this comparison: the same captures decoded from
+the native quarter-resolution U and V planes (upsampled by a method we choose
+and record) against the phone's own upsampled RGB. It replaces the RAW
+demosaic comparison, because the target device does not expose RAW; there is
+no RAW/DNG path anywhere in the project.
+
+**Three-outcome yield.** Every code frame is exactly one of: detection failed,
+detected but not recoverable (including a band index no displayed frame
+carries), or recovered.
+This holds for the configuration's own RS(n, k) (`fixed_*` columns) and for the
+goodput-maximising RS (`best_*` columns). Both are counted on the run's
+**evaluation half** (odd capture indices). The `best_*` code is chosen on the
+selection half (even indices), and `n_selection_frames` / `n_evaluation_frames`
+record the split (§10.1). `--in-sample` chooses and scores on all frames, with a
+warning, for measuring the bias only. Frames below
+`--min-px-per-cell` are excluded and counted (`n_below_resolution`).
+
+**Two goodput columns.** Every goodput is reported twice:
+
+| Column | Meaning |
+|---|---|
+| `*_goodput_mbps` | as measured: payload of the frame as drawn, with the index band |
+| `*_goodput_band_credited_mbps` | the band's cells credited back: same RS code, same measured yield, payload recomputed for the grid without the band |
+
+`band_cells_lost` and `band_cell_cost_pct` state the cost per configuration
+(1 078 cells, 2.83 % at 4 px; 280 cells, 3.57 % at 10 px), and
+`*_payload_bytes` / `*_payload_bytes_band_credited` give both payloads.
+`winners.csv` lists the winning configuration per device, condition, pixel
+source and decoder under each column, with `same_winner`; the sweep warns if
+the band's cost changes any winner. If the headline holds in both columns, the
+band is demonstrably not driving it. Crediting assumes the displaced cells would
+have had the same error statistics as the rest of the frame.
+
+**Tables.** `frames.parquet` has one row per capture × pixel source × decoder.
+`summary.parquet` / `.csv` has one row per run × pixel source × decoder; the run
+fixes configuration, condition and device. `winners.csv` is described above.
+
+**Figures** (`plots.captured_figures`): goodput surface, three-outcome bars,
+error decomposition and per-device comparison. The goodput surface and the
+per-device comparison show both goodput columns side by side on one scale, and
+the credited panel states the band's cost in every cell. Every figure shows its
+run ids, device model, pixel source, decoder, RS policy, kernel, flat-field
+state and YUV matrix/range (with "read" or "assumed"), plus the number of frames
+behind **each** point.
+The figures of the pre-registered decoder go under `headline/` and every other
+decoder's under `sensitivity/`, and the footer labels each decoder
+"(pre-registered headline)" or "(sensitivity)".
 
 ---
 
@@ -543,6 +964,37 @@ AF and AWB on it:
    no Bayer mosaic/demosaic degradation yet (see docs/pilot.md).
 10. Auto-exposure is assumed to meter the mean linear luminance of the frame;
     real AE algorithms may weight the centre or use highlights.
+11. Which frame was on screen is read from its index band, never inferred from
+    content. Measurement runs hold one static frame, so no capture can be torn
+    between frames. A capture whose band names another frame (a protocol slip)
+    counts as not recoverable.
+12. A capture whose detection failed carries no readable index, so if the phone
+    captured reference frames and one of them failed detection, it is counted
+    as a failed code frame.
+13. The mechanism experiment compares native U/V planes against upsampled RGB.
+    The target device exposes no RAW, so there is no demosaic comparison and no
+    RAW/DNG path.
+14. The band-credited goodput column assumes the cells the band displaces would
+    have had the same error statistics as the rest of the frame. The band sits
+    near the top edge, where vignetting and lens falloff are worse than average,
+    so if anything the credit is slightly generous.
+
+## Decode-benchmark bundle (Android spike)
+
+```
+python -m prism_share.export.bench --out data/bench/ --frames 50
+```
+
+This writes one folder per configuration in `BENCH_CONFIGURATIONS` (1 colour
+and 16 colours, both at 4 px). Each folder holds the ideal frames as PNG, byte
+for byte what `display frames` writes, plus `params.json` (flat `CodecParams`)
+and `ground_truth.json` (index band value, `glyph_ids` and `colour_ids` per
+frame). The bundle is meant for a second decoder in another language, so the
+JSON states every convention it depends on: the cell order rule with every
+cell's position, glyph bitmaps, palette and index band encoding.
+`tests/test_bench_export.py` rebuilds every frame from the JSON alone, so the
+description cannot drift from the code. `data/bench/README.md` gives the frame
+format version, payload bytes per frame and the `adb push` command.
 
 ## Build plan
 
@@ -550,6 +1002,6 @@ AF and AWB on it:
 2. ✅ encoder, decoder, ECC, fountain + round-trip at every colour depth × cell size
 3. ✅ Synthetic degradation: blur, noise, perspective warp, white-balance shift, chroma subsampling; pilot study
 4. ✅ `transmit/display.py` + reference frame
-5. `analysis/detect.py` + `ingest/`
-6. metrics (shape SER, colour SER, yield), `ecc_sim`, sweep → Parquet, plots
+5. ◐ `analysis/detect.py` geometry ✅, fiducial front end (needs real captures) ❌; `ingest/` ✅
+6. ✅ metrics (shape SER, colour SER, three-outcome yield), `ecc_sim`, sweep → Parquet, provenance-stamped plots
 7. dashboard (optional)

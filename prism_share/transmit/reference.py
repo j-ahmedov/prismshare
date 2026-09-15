@@ -5,7 +5,8 @@ auto-white-balance on it before the code frames play. It therefore has to:
 
 * be **geometrically identical** to the codes: same ``frame_px``, same static
   region (white border, keep-out squares, ArUco fiducials), taken verbatim
-  from ``layout.base_canvas``;
+  from ``layout.base_canvas``, and the same index band, carrying the reserved
+  index 0 so a capture of it is identified structurally;
 * present the camera with the **same linear-light average** as the codes.
   Auto-exposure meters linear light, not code values: a flat sRGB 128 grey is
   0.216 linear, while a 50/50 black-and-white pattern is 0.5. Matching the
@@ -24,7 +25,7 @@ turned white.
 One reference cannot match every configuration: the codes span about one stop
 (monochrome, with white ink, is brightest). The default target
 ``REFERENCE_TARGET_LINEAR_MEAN`` is pinned at the geometric midpoint of the
-sweep, so the worst mismatch is about +/-0.52 stops, and every configuration
+sweep, so the worst mismatch is about +/-0.51 stops, and every configuration
 is captured with *identical* camera settings - the control. The mismatch for
 every configuration is computed by ``configuration_luminance`` and recorded by
 the CLI::
@@ -49,9 +50,10 @@ import numpy.typing as npt
 
 from prism_share.codec.encoder import encode_frames, write_png
 from prism_share.codec.framing import frame_capacity
-from prism_share.codec.layout import base_canvas, static_mask
+from prism_share.codec.layout import base_canvas, draw_index_band, index_band_mask, static_mask
 from prism_share.codec.params import (
     ALLOWED_COLOUR_DEPTHS,
+    INDEX_BAND_REFERENCE,
     REFERENCE_DITHER_BLOCK_PX,
     REFERENCE_DITHER_SIZE,
     REFERENCE_TARGET_LINEAR_MEAN,
@@ -90,7 +92,10 @@ def reference_frame(frame_px: int = CodecParams().frame_px, target: float = REFE
     if frame_px % block:
         raise ValueError(f"frame_px must be a multiple of {block}")
     canvas = np.array(base_canvas(frame_px))
-    static = static_mask(frame_px)
+    draw_index_band(canvas, INDEX_BAND_REFERENCE, frame_px)
+    # The band is reserved: the dither may not use it, and it counts as static
+    # luminance (index 0 is all-black) when solving for the white fraction.
+    static = static_mask(frame_px) | index_band_mask(frame_px)
 
     # Blocks of the data region (the static region is block-aligned: all its edges are even).
     blocks_per_side = frame_px // block
@@ -151,6 +156,23 @@ def luminance_table(reference: UInt8Array, configs: list[CodecParams]) -> list[L
     return [configuration_luminance(p, ref_mean) for p in configs]
 
 
+def sweep_configurations(frame_px: int = CodecParams().frame_px) -> list[CodecParams]:
+    """Every configuration of the sweep (colour depth x cell size)."""
+    return [CodecParams(colour_depth=d, cell_px=c, frame_px=frame_px)
+            for d, c in itertools.product(ALLOWED_COLOUR_DEPTHS, SWEEP_CELL_PX)]
+
+
+def extreme_configurations(configs: list[CodecParams] | None = None) -> tuple[LuminanceRow, LuminanceRow]:
+    """(brightest, darkest) configuration by whole-frame mean linear luminance.
+
+    With exposure locked on the reference, these two are the ones that clip
+    first (brightest, at the highlights) and sink furthest into the noise floor
+    (darkest). The reference passing a clip check proves neither.
+    """
+    rows = luminance_table(reference_frame(), configs or sweep_configurations())
+    return max(rows, key=lambda r: r.frame_mean), min(rows, key=lambda r: r.frame_mean)
+
+
 def _format(reference: UInt8Array, rows: list[LuminanceRow], target: float) -> str:
     ref_mean = mean_linear_luminance(reference)
     ref_data = float(linear_luminance(reference)[~static_mask(reference.shape[0])].mean())
@@ -183,10 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    configs = [
-        CodecParams(colour_depth=d, cell_px=c, frame_px=args.frame_px)
-        for d, c in itertools.product(ALLOWED_COLOUR_DEPTHS, SWEEP_CELL_PX)
-    ]
+    configs = sweep_configurations(args.frame_px)
     target = args.target
     if args.match:
         depth, cell = (int(v) for v in args.match.split(","))

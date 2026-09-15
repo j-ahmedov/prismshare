@@ -41,7 +41,7 @@ def _ser(params: CodecParams, fault: str) -> tuple[float, float, float, float]:
         sel = cells if fault == "shape" else cells[N_FAULTS // 2 :]
         glyphs[sel] = (glyphs[sel] + rng.integers(1, params.glyph_count, size=len(sel))) % params.glyph_count
         n_shape = len(sel)
-    readout = read_symbols(render_frame(glyphs, colours, params), params)
+    readout = read_symbols(render_frame(glyphs, colours, params, truth.frame_index), params)
     return (
         float(np.mean(readout.glyphs != truth.glyphs)),
         float(np.mean(readout.colours != truth.colours)),

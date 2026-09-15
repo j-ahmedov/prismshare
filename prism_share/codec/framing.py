@@ -39,7 +39,7 @@ import numpy as np
 import numpy.typing as npt
 
 from prism_share.codec.ecc import rs_decode, rs_encode
-from prism_share.codec.layout import grid_layout
+from prism_share.codec.layout import band_cell_cost, grid_layout
 from prism_share.codec.params import BITS_PER_BYTE, CRC_FORMAT, HEADER_FORMAT, CodecParams
 from prism_share.codec.prng import keystream_array
 
@@ -110,7 +110,21 @@ class FrameDecodeResult:
 
 @functools.lru_cache(maxsize=None)
 def frame_capacity(params: CodecParams) -> FrameCapacity:
-    n_cells = grid_layout(params).n_cells
+    """The capacity of a frame as drawn: the index band's cells are not available."""
+    return _capacity(params, grid_layout(params).n_cells)
+
+
+@functools.lru_cache(maxsize=None)
+def frame_capacity_band_credited(params: CodecParams) -> FrameCapacity:
+    """The capacity the same frame would have without the index band (a deployed codec).
+
+    Used only to credit the band's cells back in the second goodput column;
+    no frame is ever drawn with this capacity.
+    """
+    return _capacity(params, grid_layout(params).n_cells + band_cell_cost(params))
+
+
+def _capacity(params: CodecParams, n_cells: int) -> FrameCapacity:
     capacity_bits = n_cells * params.bits_per_cell
     capacity_bytes = capacity_bits // BITS_PER_BYTE
     n_codewords = capacity_bytes // params.ecc_total

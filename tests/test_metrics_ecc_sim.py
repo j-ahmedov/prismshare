@@ -85,3 +85,38 @@ def test_goodput_formula() -> None:
     assert goodput_mbit_per_s(1000, 1.0, fps=30) == pytest.approx(0.24)
     with pytest.raises(ValueError):
         goodput_bytes_per_s(1000, 1.5)
+
+
+# --------------------------------------------------------------------------- out-of-sample RS selection
+
+
+def test_selection_split_is_by_position_only() -> None:
+    from prism_share.codec.params import RS_SELECTION_PERIOD
+
+    assert RS_SELECTION_PERIOD == 2
+    assert ecc_sim.selection_mask([0, 1, 2, 3, 10, 11]).tolist() == [True, False, True, False, True, False]
+
+
+def test_out_of_sample_chooses_on_selection_and_scores_on_evaluation() -> None:
+    """Selection frames are clean, evaluation frames are not: the choice cannot see the errors it is scored on."""
+    p = CodecParams(colour_depth=4, cell_px=8)
+    n = 255
+    positions = np.arange(8)
+    worst = np.where(positions % 2 == 0, 0, 3)  # evaluation frames have 3 errors in their worst codeword
+    oos = ecc_sim.out_of_sample({n: worst}, positions, p)
+    assert (oos.chosen.n, oos.chosen.k) == (n, n - 1)  # nothing to correct in the selection half
+    assert oos.evaluated.k == n - 1 and oos.evaluated.frame_yield == 0.0 and oos.evaluated.goodput_bytes_per_s == 0.0
+    assert (oos.n_selection, oos.n_evaluation) == (4, 4)
+    in_sample = ecc_sim.best_code({n: worst}, p)
+    assert in_sample.goodput_bytes_per_s > oos.evaluated.goodput_bytes_per_s  # the bias being removed
+    assert in_sample.k == n - 2 * 3  # just enough parity for the errors it saw
+
+
+def test_out_of_sample_needs_both_halves() -> None:
+    p = CodecParams(colour_depth=4, cell_px=8)
+    with pytest.raises(ValueError, match="both halves"):
+        ecc_sim.out_of_sample({155: [0, 0]}, [0, 2], p)
+    with pytest.raises(ValueError, match="both halves"):
+        ecc_sim.out_of_sample({155: [0]}, [1], p)
+    with pytest.raises(ValueError, match="length"):
+        ecc_sim.out_of_sample({155: [0, 0, 0]}, [0, 1], p)

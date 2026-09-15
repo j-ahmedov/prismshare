@@ -39,8 +39,10 @@ Variants (``DecoderOptions``), compared in the pilot study (docs/pilot.md):
   neighbouring black under 4:2:0. Much better under chroma subsampling, much
   worse under strong noise.
 
-The default (``max``/``mean``) is the algorithm described above. No variant is
-best under every degradation.
+The codec default (``max``/``mean``) is the algorithm described above. The
+**headline decoder for every analysis is pre-registered** as ``luma``/``saturated``
+(``HEADLINE_DECODER``, README section 8.1); the other three are sensitivity
+analysis. No variant is best under every degradation.
 """
 
 from __future__ import annotations
@@ -54,9 +56,24 @@ import numpy.typing as npt
 from prism_share.codec.fountain import decode_blocks
 from prism_share.codec.framing import FrameDecodeResult, decode_frame_symbols, frame_capacity
 from prism_share.codec.glyphs import glyphs_for
-from prism_share.codec.layout import black_reference_mask, cell_pixel_index, white_reference_mask
+from prism_share.codec.layout import (
+    black_reference_mask,
+    cell_pixel_index,
+    index_band,
+    white_reference_mask,
+)
 from prism_share.codec.palette import palette_for
-from prism_share.codec.params import COLOUR_CORE_FRACTION, DECODER_LUMA_MATRIX, YUV_MATRICES, CodecParams
+from prism_share.codec.params import (
+    COLOUR_CORE_FRACTION,
+    DECODER_LUMA_MATRIX,
+    HEADLINE_COLOUR_ESTIMATOR,
+    HEADLINE_SHAPE_CHANNEL,
+    INDEX_BAND_BITS,
+    INDEX_BAND_REPEATS,
+    INDEX_BAND_SAMPLE_FRACTION,
+    YUV_MATRICES,
+    CodecParams,
+)
 
 IntArray = npt.NDArray[np.int64]
 FloatArray = npt.NDArray[np.float64]
@@ -101,6 +118,34 @@ class DecoderOptions:
         return f"{self.shape_channel}/{self.colour_estimator}" + ("" if self.normalise else "/raw")
 
 
+def to_frame_resolution(rectified: npt.ArrayLike, params: CodecParams) -> FloatArray:
+    """Rectified (k*frame_px)^2 -> frame_px^2, averaging each k x k block (one screen pixel).
+
+    k is inferred from the shape. Everything that reads a frame does this first,
+    so the reference masks always line up.
+    """
+    frame = np.asarray(rectified, dtype=np.float64)
+    side = frame.shape[0] if frame.ndim in (2, 3) else -1
+    if frame.ndim not in (2, 3) or frame.shape[1] != side or side % params.frame_px or side == 0:
+        raise ValueError(f"expected (k*{params.frame_px}, k*{params.frame_px}[, 3]), got {frame.shape}")
+    k = side // params.frame_px
+    if k == 1:
+        return frame
+    f = params.frame_px
+    return frame.reshape((f, k, f, k) + frame.shape[2:]).mean(axis=(1, 3))
+
+
+#: The pre-registered headline decoder (params.HEADLINE_*); see README section 8.1.
+HEADLINE_DECODER = DecoderOptions(shape_channel=HEADLINE_SHAPE_CHANNEL, colour_estimator=HEADLINE_COLOUR_ESTIMATOR)
+#: Every decoder variant, headline first. The rest are sensitivity analysis.
+ALL_DECODERS: tuple[DecoderOptions, ...] = (HEADLINE_DECODER,) + tuple(
+    DecoderOptions(shape_channel=s, colour_estimator=c)
+    for s in ("max", "luma") for c in ("mean", "saturated")
+    if (s, c) != (HEADLINE_SHAPE_CHANNEL, HEADLINE_COLOUR_ESTIMATOR)
+)
+SENSITIVITY_DECODERS: tuple[DecoderOptions, ...] = ALL_DECODERS[1:]
+
+
 def normalise_levels(frame: FloatArray, frame_px: int) -> FloatArray:
     """Map the reference black to 0 and reference white to 1, per channel, clipped."""
     white = np.median(frame[white_reference_mask(frame_px)], axis=0)
@@ -112,10 +157,13 @@ def normalise_levels(frame: FloatArray, frame_px: int) -> FloatArray:
 def read_symbols(
     rectified: npt.ArrayLike, params: CodecParams, options: DecoderOptions = DecoderOptions()
 ) -> SymbolReadout:
-    """Read every cell of a rectified frame."""
-    frame = np.asarray(rectified, dtype=np.float64)
-    if frame.shape[:2] != (params.frame_px, params.frame_px) or frame.ndim not in (2, 3):
-        raise ValueError(f"expected ({params.frame_px}, {params.frame_px}[, 3]), got {frame.shape}")
+    """Read every cell of a rectified frame.
+
+    The frame may be rectified at any integer scale k: shape (k*frame_px,
+    k*frame_px[, 3]). k is inferred from the shape, and each k x k block (one
+    screen pixel) is averaged down to frame resolution before decoding.
+    """
+    frame = to_frame_resolution(rectified, params)
     is_rgb = frame.ndim == 3
     if is_rgb and frame.shape[2] != 3:
         raise ValueError("colour input must have 3 channels (RGB)")
@@ -181,6 +229,49 @@ def _classify_colour(
     nearest = np.take_along_axis(dist, order[:, :1], axis=1)[:, 0]
     runner_up = np.take_along_axis(dist, order[:, 1:2], axis=1)[:, 0]
     return order[:, 0].astype(np.int64), runner_up - nearest
+
+
+@dataclass(frozen=True)
+class IndexReadout:
+    """The frame index read from the index band."""
+
+    index: int
+    """0 = the reference frame; 1 upward = code frames."""
+    agreement: float
+    """Fraction of the INDEX_BAND_REPEATS copies that agreed, averaged over bits.
+    1.0 = unanimous; the lowest possible value is (repeats // 2 + 1) / repeats."""
+    margin: float
+    """Smallest distance from 0.5 of any block's normalised level, in [0, 0.5].
+    Near 0 means a block sat on the black/white decision boundary."""
+
+
+def read_index_band(rectified: npt.ArrayLike, params: CodecParams, *, normalise: bool = True) -> IndexReadout:
+    """Read the frame's own index from its band. Works at every configuration.
+
+    The band's blocks are two orders of magnitude larger in area than any data
+    cell and are always pure black or white, so this succeeds wherever the
+    fiducials were found at all - which is exactly when a frame needs
+    identifying. Each bit is carried INDEX_BAND_REPEATS times across the band
+    and decided by majority vote.
+    """
+    frame = to_frame_resolution(rectified, params)
+    plane = normalise_levels(frame, params.frame_px) if normalise else frame / _FULL_SCALE
+    if plane.ndim == 3:
+        plane = plane.mean(axis=2)  # the band is achromatic; averaging channels only lowers noise
+
+    band = index_band(params.frame_px)
+    inset = int(round(band.block_px * (1 - INDEX_BAND_SAMPLE_FRACTION) / 2))
+    levels = []
+    for position in range(band.blocks):
+        x, y = band.block_origin(position)
+        levels.append(float(plane[y + inset : y + band.height - inset, x + inset : x + band.block_px - inset].mean()))
+    values = np.array(levels).reshape(INDEX_BAND_REPEATS, INDEX_BAND_BITS)
+    bits = values >= 0.5
+    votes = bits.sum(axis=0)
+    majority = votes > INDEX_BAND_REPEATS // 2
+    index = int("".join("1" if b else "0" for b in majority), 2)
+    agreement = float(np.mean(np.where(majority, votes, INDEX_BAND_REPEATS - votes) / INDEX_BAND_REPEATS))
+    return IndexReadout(index=index, agreement=agreement, margin=float(np.abs(values - 0.5).min()))
 
 
 def decode_frame(

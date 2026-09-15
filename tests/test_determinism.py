@@ -24,8 +24,8 @@ PAYLOAD = b"prism-share golden frame"
 # NOT portable; a mismatch after an intentional codec change means these must be
 # updated and every earlier capture regenerated.
 GOLDEN = {
-    CodecParams(): "485019060ae731c03181189bad535d17edaa43faede7b6e54c2dc57a92f9b97e",
-    CodecParams(colour_depth=1, cell_px=4, seed=7): "71eba77f04e49e3c3ee9ba2bbd5eceea2fa2aaf03ea52816ab6d6e5efa850141",
+    CodecParams(): "0792eb588203b9bfa2b99cb6af793c59f673b3fe6d7506284aede77b716cb6a5",
+    CodecParams(colour_depth=1, cell_px=4, seed=7): "cabaff7a554b162f84606ad92ec0f5af08cab3491a3291e5e196c5e0163cf8a9",
 }
 
 

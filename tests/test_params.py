@@ -69,7 +69,8 @@ def test_serialisation_round_trip() -> None:
 
 def test_fingerprint_is_stable_and_discriminating() -> None:
     # Pinned: the fingerprint is embedded in every frame header, so it must never drift.
-    assert CodecParams().fingerprint() == 2013704606
+    # It covers FRAME_FORMAT_VERSION too, so a capture of an older frame layout is rejected.
+    assert CodecParams().fingerprint() == 832099643
     fps = {CodecParams(colour_depth=d, cell_px=c).fingerprint() for d in (1, 2, 4) for c in (4, 5, 6)}
     assert len(fps) == 9
 

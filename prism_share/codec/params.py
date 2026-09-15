@@ -30,6 +30,12 @@ SWEEP_CELL_PX: Final[tuple[int, ...]] = (4, 5, 6, 8, 10)
 #: Smallest cell for which a 16-glyph set with a useful distance exists.
 MIN_CELL_PX: Final[int] = 4
 
+#: Bumped whenever the pixel layout of a frame changes. It enters
+#: CodecParams.fingerprint(), so a frame drawn by an older format fails the
+#: fingerprint check instead of being decoded with the wrong geometry.
+#: 1 = fiducials + cell grid. 2 = adds the index band (2026-09-12).
+FRAME_FORMAT_VERSION: Final[int] = 2
+
 BITS_PER_BYTE: Final[int] = 8
 #: Reed-Solomon over GF(2^8): a codeword is at most 255 symbols.
 RS_MAX_CODEWORD: Final[int] = 255
@@ -70,6 +76,28 @@ FIDUCIAL_MODULES: Final[int] = FIDUCIAL_BITS + 2 * FIDUCIAL_BORDER_BITS
 FIDUCIAL_PX: Final[int] = FIDUCIAL_MODULES * FIDUCIAL_MODULE_PX
 #: Side of the square at each corner that holds no data cells.
 KEEPOUT_PX: Final[int] = BORDER_PX + FIDUCIAL_PX + FIDUCIAL_MARGIN_PX
+
+# --------------------------------------------------------------------------- #
+# Index band: the frame's own identity, readable at every configuration
+# --------------------------------------------------------------------------- #
+# A reserved horizontal band of large black/white blocks carrying an 8-bit
+# frame index, centred between the two top keep-out squares. Its geometry is
+# constant for every configuration, exactly like the fiducials, and it never
+# uses colour. Index 0 is the reference frame; code frames are 1 upward.
+
+#: Bits of frame index.
+INDEX_BAND_BITS: Final[int] = 8
+#: Copies of the index across the band; the reader takes a majority vote.
+INDEX_BAND_REPEATS: Final[int] = 3
+#: Side of one block. An order of magnitude larger than any data cell, so the
+#: band is readable wherever the code is, at every cell_px.
+INDEX_BAND_BLOCK_PX: Final[int] = 32
+#: Background margin around the band, keeping it clear of the white border and
+#: of the data cells.
+INDEX_BAND_MARGIN_PX: Final[int] = 8
+#: Index reserved for the reference frame.
+INDEX_BAND_REFERENCE: Final[int] = 0
+
 #: The decoder's white level is sampled from the border band, and its black
 #: level from the markers' black border modules, each inset by this many pixels
 #: from every black/white edge so blur cannot mix the two.
@@ -139,6 +167,26 @@ FOUNTAIN_MIN_REPAIR: Final[int] = 4
 #: constant: capture timing never enters a result.
 ASSUMED_FPS: Final[float] = 30.0
 
+#: RS codes are chosen out of sample. A frame at position p (pilot: frame
+#: index; capture: the capture's ``index`` in frames.jsonl, assigned before any
+#: analysis) is in the *selection* half iff p % RS_SELECTION_PERIOD == 0 and in
+#: the *evaluation* half otherwise. The goodput-maximising RS(n, k) is chosen on
+#: the selection half and goodput is scored only on the evaluation half. The
+#: halves interleave rather than split first/second so that slow drift over a
+#: run (panel warm-up, room light) lands in both equally instead of
+#: separating them. The rule depends on position only, so every configuration
+#: in a condition gets the same split and comparisons stay paired.
+RS_SELECTION_PERIOD: Final[int] = 2
+
+#: (colour_depth, cell_px) of the decode-benchmark bundle for the Android spike
+#: (prism_share/export/bench.py): the two ends of the colour axis at the
+#: smallest cell, i.e. the most cells and the most work per frame.
+BENCH_CONFIGURATIONS: Final[tuple[tuple[int, int], ...]] = ((1, 4), (16, 4))
+
+#: Version of the benchmark bundle's ground_truth.json layout. Bump on any change
+#: a reader could notice.
+BENCH_SCHEMA_VERSION: Final[int] = 1
+
 # --------------------------------------------------------------------------- #
 # Colour spaces (see prism_share/colourspace.py)
 # --------------------------------------------------------------------------- #
@@ -171,6 +219,18 @@ DECODER_LUMA_MATRIX: Final[str] = "bt601"
 #: 'saturated' colour estimator: average this fraction of a cell's ink pixels,
 #: the most saturated ones (the least diluted by neighbouring black).
 COLOUR_CORE_FRACTION: Final[float] = 0.25
+#: PRE-REGISTERED headline decoder (2026-09-14, before any real capture exists).
+#: Every headline number, table and figure uses it; the other three variants are
+#: reported as sensitivity analysis, never promoted. Reasons (README, section 8.1):
+#: shape from luma because Y is the only full-resolution plane of YUV_420_888;
+#: colour from the most saturated ink pixels because 4:2:0 dilutes chroma at every
+#: glyph edge on every capture. Changing these values invalidates the pre-registration.
+HEADLINE_SHAPE_CHANNEL: Final[str] = "luma"
+HEADLINE_COLOUR_ESTIMATOR: Final[str] = "saturated"
+HEADLINE_DECODER_REGISTERED: Final[str] = "2026-09-14"
+#: A winner whose goodput exceeds the comparison by less than this (percent) is a
+#: near-tie and is flagged wherever winners are reported.
+NEAR_TIE_MARGIN_PCT: Final[float] = 5.0
 
 # --------------------------------------------------------------------------- #
 # Reference frame (see transmit/reference.py)
@@ -178,14 +238,63 @@ COLOUR_CORE_FRACTION: Final[float] = 0.25
 
 #: Whole-frame mean linear luminance the reference frame is built to. Pinned so
 #: the reference is identical for every run. Value: geometric midpoint of the
-#: darkest (0.2178, 2 colours / 4 px) and brightest (0.4470, mono / 10 px)
+#: darkest (0.2174, 4 colours / 4 px; 2 colours / 4 px is within frame-to-frame spread)
+#: and brightest (0.4375, mono / 10 px)
 #: sweep configurations, which minimises the worst-case exposure mismatch
-#: (about +/-0.52 stops). See transmit/reference.py and docs/reference_frame.md.
-REFERENCE_TARGET_LINEAR_MEAN: Final[float] = 0.312
+#: (about +/-0.50 stops). See transmit/reference.py and docs/reference_frame.md.
+REFERENCE_TARGET_LINEAR_MEAN: Final[float] = 0.308
 #: Side of the ordered-dither (Bayer) threshold matrix; must be a power of two.
 REFERENCE_DITHER_SIZE: Final[int] = 16
 #: Screen pixels per dither element: 2 keeps every feature >= 2 px, like the glyphs.
 REFERENCE_DITHER_BLOCK_PX: Final[int] = 2
+
+# --------------------------------------------------------------------------- #
+# Detection and rectification (see analysis/detect.py)
+# ONE parameter set for every configuration: nothing here may depend on
+# colour_depth or cell_px (the fiducials are identical so detection is too).
+# --------------------------------------------------------------------------- #
+
+#: Resampling kernels for rectification, name -> OpenCV interpolation flag name.
+RECTIFY_KERNELS: Final[dict[str, str]] = {
+    "nearest": "INTER_NEAREST",
+    "bilinear": "INTER_LINEAR",
+    "lanczos": "INTER_LANCZOS4",
+}
+RECTIFY_DEFAULT_KERNEL: Final[str] = "bilinear"
+#: Intensity profiles taken across each marker edge during sub-pixel refinement.
+REFINE_EDGE_SAMPLES: Final[int] = 24
+#: Part of each edge that is sampled, as fractions of its length (corners are
+#: rounded by blur, so the ends are avoided and corners come from line fits).
+REFINE_EDGE_SPAN: Final[tuple[float, float]] = (0.15, 0.85)
+#: Half-length of each profile in marker modules: must stay inside the black
+#: border ring (1 module) and the white margin (1 module).
+REFINE_PROFILE_HALF_MODULES: Final[float] = 0.75
+#: Sampling step along a profile, in source pixels.
+REFINE_PROFILE_STEP_PX: Final[float] = 0.25
+#: Refinement passes (each re-centres profiles on the previous fit).
+REFINE_ITERATIONS: Final[int] = 3
+#: Minimum white-minus-black step (8-bit code values) for an edge to count as found.
+REFINE_MIN_EDGE_CONTRAST: Final[float] = 20.0
+#: Side, in frame pixels, of the window over which the flat-field gain is estimated.
+FLAT_FIELD_WINDOW_FRAME_PX: Final[int] = 64
+
+# --------------------------------------------------------------------------- #
+# Captured-data analysis (see analysis/sweep.py)
+# --------------------------------------------------------------------------- #
+
+#: Pixel sources a captured YUV_420_888 frame can be decoded from:
+#: 'y' = the Y plane alone (monochrome only), 'rgb' = the phone's own RGB PNG,
+#: 'yuv_nearest' / 'yuv_bilinear' = our conversion of the native Y, U, V planes
+#: with the manifest's matrix and range, chroma upsampled by that method.
+PIXEL_SOURCES: Final[tuple[str, ...]] = ("y", "rgb", "yuv_nearest", "yuv_bilinear")
+#: The JPEG comparison path carries one image per frame, so one pixel source.
+JPEG_PIXEL_SOURCE: Final[str] = "jpeg"
+#: Fraction of each index-band block (centred) averaged when reading a bit,
+#: keeping block edges - the only part blur can reach - out of the measurement.
+INDEX_BAND_SAMPLE_FRACTION: Final[float] = 0.5
+#: Stand-in maximum codeword error count for a frame that was not detected:
+#: larger than any codeword, so no RS(n, k) ever recovers it.
+UNDETECTED_CW_ERRORS: Final[int] = 10**6
 
 # --------------------------------------------------------------------------- #
 # Display (see transmit/display.py)
@@ -316,8 +425,13 @@ class CodecParams:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
     def fingerprint(self) -> int:
-        """Unsigned 32-bit hash of the canonical JSON, embedded in every frame."""
-        digest = hashlib.sha256(self.to_json().encode("ascii")).digest()
+        """Unsigned 32-bit hash of the canonical JSON and the frame format version.
+
+        The format version is included so a capture of a frame drawn by an
+        earlier layout fails the header check rather than being decoded with
+        today's geometry.
+        """
+        digest = hashlib.sha256(f"v{FRAME_FORMAT_VERSION}|{self.to_json()}".encode("ascii")).digest()
         return int.from_bytes(digest[:4], "big")
 
     def replace(self, **changes: int) -> CodecParams:

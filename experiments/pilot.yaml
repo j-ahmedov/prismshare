@@ -6,7 +6,7 @@
 # Every configuration is also decoded undegraded ("clean").
 
 seed: 0                   # CodecParams.seed of every configuration
-frames_per_condition: 4   # encoded frames per configuration; each is degraded and decoded once per condition
+frames_per_condition: 200 # encoded frames per configuration; each is degraded and decoded once per condition
 colour_depths: [1, 2, 4, 8, 16]
 cell_px: [4, 5, 6, 8, 10]
 
@@ -20,10 +20,11 @@ decoders:
   - {shape_channel: luma, colour_estimator: mean}
   - {shape_channel: luma, colour_estimator: saturated}
 
-# The decoder whose results the headline tables and figures report.
-# Chosen from the ablation: smallest total goodput loss against the best decoder
-# in each condition (see docs/pilot.md, "Decoder ablation").
-headline_decoder: {shape_channel: luma, colour_estimator: saturated}
+# The headline decoder is NOT set here. It is pre-registered in
+# prism_share/codec/params.py (HEADLINE_SHAPE_CHANNEL, HEADLINE_COLOUR_ESTIMATOR),
+# for the reasons in README section 8.1, and load_config refuses a
+# `headline_decoder` key. It must appear in the list above; the other variants
+# are reported as sensitivity analysis.
 
 series:
   - name: blur
@@ -41,11 +42,11 @@ series:
   - name: chroma_nearest
     degradation: chroma
     options: {matrix: bt601, full_range: false, upsample: nearest}
-    severities: [1, 1.5, 2, 3, 4]
+    severities: [1, 1.5, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 3.75, 4]
   - name: chroma_bilinear
     degradation: chroma
     options: {matrix: bt601, full_range: false, upsample: bilinear}
-    severities: [1, 1.5, 2, 3, 4]
+    severities: [1, 1.5, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 3.75, 4]
   - name: chroma_bt709_nearest
     degradation: chroma
     options: {matrix: bt709, full_range: false, upsample: nearest}

@@ -31,12 +31,35 @@ from prism_share.codec.fountain import (
 )
 from prism_share.codec.framing import FrameHeader, encode_frame_symbols, frame_capacity
 from prism_share.codec.glyphs import glyphs_for
-from prism_share.codec.layout import base_canvas, cell_pixel_index
+from prism_share.codec.layout import base_canvas, cell_pixel_index, draw_index_band
 from prism_share.codec.palette import palette_for
-from prism_share.codec.params import BACKGROUND_RGB, CodecParams
+from prism_share.codec.params import (
+    BACKGROUND_RGB,
+    INDEX_BAND_BITS,
+    INDEX_BAND_REFERENCE,
+    CodecParams,
+)
 
 UInt8Array = npt.NDArray[np.uint8]
 IntArray = npt.NDArray[np.int64]
+
+
+#: Distinct frame indices the band can carry for code frames: 1 .. 2**bits - 1
+#: (0 is the reference frame).
+INDEX_BAND_CODE_INDICES = 2**INDEX_BAND_BITS - 1
+
+
+def band_index(block_id: int) -> int:
+    """The index band value for a fountain block: 1 upward, wrapping.
+
+    Wraps rather than failing, because a real payload can need thousands of
+    frames while the band is 8 bits. Analysis run definitions may therefore
+    display at most INDEX_BAND_CODE_INDICES distinct frames, which
+    ingest/rundef.py enforces.
+    """
+    if block_id < 0:
+        raise ValueError("block_id must be >= 0")
+    return INDEX_BAND_REFERENCE + 1 + block_id % INDEX_BAND_CODE_INDICES
 
 
 @dataclass(frozen=True)
@@ -44,6 +67,8 @@ class EncodedFrame:
     """One frame plus its ground truth."""
 
     header: FrameHeader
+    frame_index: int
+    """The value drawn in the index band (band_index of the block id)."""
     glyphs: IntArray
     """(n_cells,) glyph index per cell."""
     colours: IntArray
@@ -70,8 +95,8 @@ def cell_tiles(params: CodecParams) -> UInt8Array:
     return tiles.astype(np.uint8)
 
 
-def render_frame(glyphs: IntArray, colours: IntArray, params: CodecParams) -> UInt8Array:
-    """Draw a frame from per-cell symbol indices. Pure function of its arguments."""
+def render_frame(glyphs: IntArray, colours: IntArray, params: CodecParams, frame_index: int) -> UInt8Array:
+    """Draw a frame from per-cell symbol indices and its index band. Pure function of its arguments."""
     glyphs = np.asarray(glyphs, dtype=np.int64)
     colours = np.asarray(colours, dtype=np.int64)
     rows, cols = cell_pixel_index(params)
@@ -82,6 +107,7 @@ def render_frame(glyphs: IntArray, colours: IntArray, params: CodecParams) -> UI
     if colours.min() < 0 or colours.max() >= params.colour_depth:
         raise ValueError("colour index out of range")
     frame = np.array(base_canvas(params.frame_px))  # writable copy
+    draw_index_band(frame, frame_index, params.frame_px)
     frame[rows, cols] = cell_tiles(params)[glyphs, colours]
     return frame
 
@@ -108,7 +134,8 @@ def encode_frames(payload: bytes, params: CodecParams, *, n_frames: int | None =
     for block_id in range(total):
         header = FrameHeader(block_id, k, len(payload), fingerprint)
         glyphs, colours = encode_frame_symbols(header, encode_block(source, block_id, params.seed), params)
-        frames.append(EncodedFrame(header, glyphs, colours, render_frame(glyphs, colours, params)))
+        index = band_index(block_id)
+        frames.append(EncodedFrame(header, index, glyphs, colours, render_frame(glyphs, colours, params, index)))
     return frames
 
 

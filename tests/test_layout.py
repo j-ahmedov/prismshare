@@ -115,3 +115,64 @@ def test_reference_masks_sample_the_right_levels() -> None:
 def test_keepout_squares_are_in_the_corners() -> None:
     far = FRAME_PX - KEEPOUT_PX
     assert layout.keepout_origins(FRAME_PX) == ((0, 0), (far, 0), (far, far), (0, far))
+
+
+# --------------------------------------------------------------------------- index band
+
+
+def test_index_band_geometry_is_constant_across_configurations() -> None:
+    """Like the fiducials: same pixels for every configuration. Only the index changes it."""
+    band = layout.index_band(FRAME_PX)
+    mask = layout.index_band_mask(FRAME_PX)
+    reference = None
+    for params in ALL_CONFIGS:
+        frame = encode(b"band " + params.label.encode(), params, n_frames=1)[0]
+        if reference is None:
+            reference = frame[mask]
+        assert np.array_equal(frame[mask], reference), params.label
+    assert (band.x, band.y, band.block_px, band.blocks) == (128, 24, 32, 24)
+    assert band.width == 768 and band.height == 32
+
+
+def test_index_band_is_black_and_white_only() -> None:
+    mask = layout.index_band_mask(FRAME_PX)
+    for params in (CodecParams(colour_depth=16, cell_px=4), CodecParams(colour_depth=1, cell_px=10)):
+        values = encode(b"x", params, n_frames=1)[0][mask]
+        assert set(np.unique(values)) <= {0, 255}
+        assert (values == values[:, :1]).all(), "the band must never carry colour"
+
+
+def test_index_band_blocks_dwarf_a_data_cell() -> None:
+    """The band is readable wherever the code is: its blocks are an order of magnitude larger."""
+    band = layout.index_band(FRAME_PX)
+    assert band.block_px >= 24
+    for cell_px in SWEEP_CELL_PX:
+        assert band.block_px >= 3 * cell_px
+
+
+@pytest.mark.parametrize("params", ALL_CONFIGS, ids=lambda p: p.label)
+def test_cells_keep_clear_of_the_index_band(params: CodecParams) -> None:
+    rows, cols = layout.cell_pixel_index(params)
+    occupancy = np.zeros((FRAME_PX, FRAME_PX), dtype=bool)
+    occupancy[rows.ravel(), cols.ravel()] = True
+    assert not (occupancy & layout.index_band_mask(FRAME_PX)).any()
+    g = params.cell_gap_px
+    lay = layout.grid_layout(params)
+    grown = np.zeros_like(occupancy)
+    for x, y in zip(lay.cell_x, lay.cell_y, strict=True):
+        grown[y - g : y + params.cell_px + g, x - g : x + params.cell_px + g] = True
+    assert not (grown & layout.index_band_mask(FRAME_PX)).any()
+
+
+def test_index_band_does_not_overlap_the_static_region() -> None:
+    assert not (layout.index_band_mask(FRAME_PX) & layout.static_mask(FRAME_PX)).any()
+
+
+def test_index_band_bits_repeat_the_index() -> None:
+    from prism_share.codec.params import INDEX_BAND_BITS, INDEX_BAND_REPEATS
+
+    bits = layout.index_band_bits(0b10110001)
+    assert bits == [1, 0, 1, 1, 0, 0, 0, 1] * INDEX_BAND_REPEATS
+    assert len(bits) == INDEX_BAND_BITS * INDEX_BAND_REPEATS
+    with pytest.raises(ValueError):
+        layout.index_band_bits(2**INDEX_BAND_BITS)

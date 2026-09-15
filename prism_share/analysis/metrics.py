@@ -15,6 +15,7 @@ Goodput is derived, never timed (hard requirement 7)::
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 import numpy.typing as npt
@@ -82,6 +83,45 @@ def byte_errors(
     truth = np.frombuffer(symbols_to_stream(np.asarray(truth_glyphs), np.asarray(truth_colours), params), np.uint8)
     got = np.frombuffer(symbols_to_stream(np.asarray(decoded_glyphs), np.asarray(decoded_colours), params), np.uint8)
     return truth != got
+
+
+class FrameOutcome(str, Enum):
+    """What happened to one captured code frame. Always three outcomes, never two:
+    they have different causes (optics/geometry vs channel errors) and different fixes."""
+
+    DETECTION_FAILED = "detection_failed"
+    NOT_RECOVERABLE = "not_recoverable"
+    RECOVERED = "recovered"
+
+
+def frame_outcome(detected: bool, max_codeword_errors: int, n: int, k: int) -> FrameOutcome:
+    """Classify a frame under RS(n, k): recovered iff detected and every codeword has <= (n-k)//2 errors."""
+    if not detected:
+        return FrameOutcome.DETECTION_FAILED
+    return FrameOutcome.RECOVERED if max_codeword_errors <= (n - k) // 2 else FrameOutcome.NOT_RECOVERABLE
+
+
+@dataclass(frozen=True)
+class YieldBreakdown:
+    n_frames: int
+    detection_failed: int
+    not_recoverable: int
+    recovered: int
+
+    @property
+    def frame_yield(self) -> float:
+        """Recovered / all code frames: the yield that enters goodput."""
+        return self.recovered / self.n_frames if self.n_frames else 0.0
+
+    def fractions(self) -> dict[str, float]:
+        n = self.n_frames or 1
+        return {o.value: getattr(self, o.value) / n for o in FrameOutcome}
+
+
+def yield_breakdown(outcomes: list[FrameOutcome]) -> YieldBreakdown:
+    counts = {o: sum(1 for x in outcomes if x == o) for o in FrameOutcome}
+    return YieldBreakdown(len(outcomes), counts[FrameOutcome.DETECTION_FAILED], counts[FrameOutcome.NOT_RECOVERABLE],
+                          counts[FrameOutcome.RECOVERED])
 
 
 def goodput_bytes_per_s(payload_bytes_per_frame: float, frame_yield: float, fps: float = ASSUMED_FPS) -> float:

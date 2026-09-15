@@ -16,6 +16,5 @@ pyparsing==3.3.2
 pytest==9.1.1
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
-rawpy==0.27.1
 reedsolo==1.7.0
 six==1.17.0

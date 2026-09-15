@@ -6,6 +6,8 @@ Frame anatomy (square, ``frame_px`` side, RGB, origin top-left, x right, y down)
 * At each corner a ``KEEPOUT_PX`` square, white, holding an ArUco marker
   (black on white, ``FIDUCIAL_PX`` side) at offset ``BORDER_PX`` from both
   frame edges. Marker ids ``FIDUCIAL_IDS`` run clockwise from top-left.
+* A reserved **index band** of large black/white blocks between the two top
+  keep-out squares, carrying the frame's own index (see ``index_band``).
 * Everything else is the data region: black background carrying the cells.
 
 The border band plus the four keep-out squares form the **static region**. Its
@@ -13,10 +15,14 @@ pixels depend on ``frame_px`` alone - never on colour depth, cell size, ECC or
 seed - and contain only pure black and pure white. This is the constraint that
 keeps detection difficulty out of the experiment.
 
+The index band is *not* part of the static region: its geometry is constant
+for every configuration, but its blocks carry the frame index, so two frames
+of the same configuration differ there. It never uses colour.
+
 The cell grid: pitch = cell_px + cell_gap_px, as many cells per side as fit in
 the data region with at least ``cell_gap_px`` of background on every side of
 every cell; the grid is centred. Cells whose gap-padded box would touch a
-keep-out square are dropped. Remaining cells are numbered row-major (top to
+keep-out square or the index band are dropped. Remaining cells are numbered row-major (top to
 bottom, left to right); that number is the cell index everywhere else.
 """
 
@@ -33,6 +39,10 @@ from prism_share.codec.params import (
     BLACK_REF_INSET_PX,
     BLACK_RGB,
     BORDER_PX,
+    INDEX_BAND_BITS,
+    INDEX_BAND_BLOCK_PX,
+    INDEX_BAND_MARGIN_PX,
+    INDEX_BAND_REPEATS,
     FIDUCIAL_BORDER_BITS,
     FIDUCIAL_IDS,
     FIDUCIAL_MODULE_PX,
@@ -175,6 +185,71 @@ def base_canvas(frame_px: int) -> UInt8Array:
 
 
 # --------------------------------------------------------------------------- #
+# Index band
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class IndexBand:
+    """Where the frame-index band sits and how big its blocks are. Identical for every CodecParams."""
+
+    x: int
+    y: int
+    block_px: int
+    blocks: int
+    """INDEX_BAND_BITS * INDEX_BAND_REPEATS."""
+
+    @property
+    def width(self) -> int:
+        return self.blocks * self.block_px
+
+    @property
+    def height(self) -> int:
+        return self.block_px
+
+    def block_origin(self, position: int) -> tuple[int, int]:
+        return self.x + position * self.block_px, self.y
+
+
+@functools.lru_cache(maxsize=None)
+def index_band(frame_px: int) -> IndexBand:
+    """The band: one row of blocks, centred between the two top keep-out squares."""
+    blocks = INDEX_BAND_BITS * INDEX_BAND_REPEATS
+    width = blocks * INDEX_BAND_BLOCK_PX
+    available = frame_px - 2 * KEEPOUT_PX
+    if width > available:
+        raise ValueError(f"index band ({width} px) does not fit between the keep-out squares ({available} px)")
+    return IndexBand(x=(frame_px - width) // 2, y=BORDER_PX + INDEX_BAND_MARGIN_PX,
+                     block_px=INDEX_BAND_BLOCK_PX, blocks=blocks)
+
+
+def index_band_bits(index: int) -> list[int]:
+    """The blocks of ``index``: its bits MSB-first, repeated INDEX_BAND_REPEATS times."""
+    if not 0 <= index < 2**INDEX_BAND_BITS:
+        raise ValueError(f"frame index must fit in {INDEX_BAND_BITS} bits, got {index}")
+    bits = [(index >> shift) & 1 for shift in range(INDEX_BAND_BITS - 1, -1, -1)]
+    return bits * INDEX_BAND_REPEATS
+
+
+@functools.lru_cache(maxsize=None)
+def index_band_mask(frame_px: int) -> BoolArray:
+    """True on the band's blocks (not its background margin)."""
+    band = index_band(frame_px)
+    mask = np.zeros((frame_px, frame_px), dtype=bool)
+    mask[band.y : band.y + band.height, band.x : band.x + band.width] = True
+    mask.setflags(write=False)
+    return mask
+
+
+def draw_index_band(canvas: UInt8Array, index: int, frame_px: int) -> None:
+    """Draw ``index`` into ``canvas`` in place: pure black and white blocks, never colour."""
+    band = index_band(frame_px)
+    for position, bit in enumerate(index_band_bits(index)):
+        x, y = band.block_origin(position)
+        canvas[y : y + band.height, x : x + band.block_px] = WHITE_RGB if bit else BLACK_RGB
+
+
+# --------------------------------------------------------------------------- #
 # Data grid
 # --------------------------------------------------------------------------- #
 
@@ -182,6 +257,21 @@ def base_canvas(frame_px: int) -> UInt8Array:
 @functools.lru_cache(maxsize=None)
 def grid_layout(params: CodecParams) -> GridLayout:
     """Cell positions for ``params`` (cached; arrays are read-only)."""
+    return _grid(params, reserve_band=True)
+
+
+@functools.lru_cache(maxsize=None)
+def band_cell_cost(params: CodecParams) -> int:
+    """Data cells the index band displaces for ``params``.
+
+    The band is measurement apparatus, not codec: a deployed system would carry
+    its frame index in the fountain header. Its cost depends on cell_px, so it
+    is reported per configuration and credited back in a second goodput column.
+    """
+    return _grid(params, reserve_band=False).n_cells - grid_layout(params).n_cells
+
+
+def _grid(params: CodecParams, *, reserve_band: bool) -> GridLayout:
     inner = params.frame_px - 2 * BORDER_PX
     gap, pitch = params.cell_gap_px, params.pitch_px
     per_side = (inner - gap) // pitch
@@ -192,11 +282,16 @@ def grid_layout(params: CodecParams) -> GridLayout:
     ys, xs = np.meshgrid(origin + idx * pitch, origin + idx * pitch, indexing="ij")
     ys, xs = ys.ravel(), xs.ravel()
 
-    # A cell is kept if its box grown by `gap` on every side misses every keep-out square.
+    # A cell is kept if its box grown by `gap` on every side misses every reserved
+    # rectangle: the four keep-out squares and the index band.
+    reserved = [(kx, ky, KEEPOUT_PX, KEEPOUT_PX) for kx, ky in keepout_origins(params.frame_px)]
+    if reserve_band:
+        band = index_band(params.frame_px)
+        reserved.append((band.x, band.y, band.width, band.height))
     keep = np.ones(len(xs), dtype=bool)
-    for kx, ky in keepout_origins(params.frame_px):
-        overlap_x = (xs - gap < kx + KEEPOUT_PX) & (xs + params.cell_px + gap > kx)
-        overlap_y = (ys - gap < ky + KEEPOUT_PX) & (ys + params.cell_px + gap > ky)
+    for rx, ry, rw, rh in reserved:
+        overlap_x = (xs - gap < rx + rw) & (xs + params.cell_px + gap > rx)
+        overlap_y = (ys - gap < ry + rh) & (ys + params.cell_px + gap > ry)
         keep &= ~(overlap_x & overlap_y)
 
     cell_x, cell_y = xs[keep], ys[keep]

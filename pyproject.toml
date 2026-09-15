@@ -13,7 +13,6 @@ dependencies = [
     "opencv-python>=4.8",
     "Pillow>=10.0",
     "reedsolo>=1.7",
-    "rawpy>=0.19",
     "pandas>=2.1",
     "pyarrow>=14",
     "matplotlib>=3.8",

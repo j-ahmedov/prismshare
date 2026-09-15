@@ -1,7 +1,8 @@
 """Fullscreen frame player for the transmitter.
 
     python -m prism_share.transmit.display frames --colour-depth 4 --cell-px 8 --payload-bytes 200000 --out data/runs/c4_px8
-    python -m prism_share.transmit.display play data/runs/c4_px8 --reference
+    python -m prism_share.transmit.display measure experiments/runs/<run_id>.yaml     # THE measurement path
+    python -m prism_share.transmit.display play data/runs/c4_px8 --reference         # demonstrator only
     python -m prism_share.transmit.display calibrate
     python -m prism_share.transmit.display verify screenshot.png --frame data/runs/c4_px8/frame_00000.png
 
@@ -20,11 +21,20 @@ README, "Transmitter"):
   distinct RGB triples with pixel counts and SHA-256 hashes of the frame and
   of the composed screen buffer, and every display event with its monotonic
   timestamp.
-* The same code path serves the free-running sequence, single-frame hold
-  (arrow keys step), the reference frame and ``calibrate`` (solid patches).
+* The same code path serves ``measure``, ``play``, the reference frame and
+  ``calibrate`` (solid patches).
 
-Keys: space = play/pause, right/down = next, left/up = previous,
-r = reference frame, q/Esc = quit. Stepping pauses free-running playback.
+**Measurement vs demonstration.** ``measure`` is the only measurement path. It
+reads a run definition and shows, in order: the reference frame (lock AE, AF
+and AWB), the brightest and darkest clip-check configurations (check clipping),
+then the run's ONE frame, which is held for the whole capture. It never plays
+and never advances on its own, and there is nothing after the run's frame to
+advance to, so a capture can never be torn between two frames. ``play`` is a
+free-running demonstrator: it is logged as ``measurement: false`` and warns on
+start, and nothing it displays is a valid capture for the sweep.
+
+Keys: space = play/pause (not in ``measure``), right/down = next, left/up =
+previous, r = reference frame, q/Esc = quit. Stepping pauses free-running playback.
 
 ``verify`` checks a screenshot of the running player against a frame: exact
 match at an integer scale proves that neither the OS nor the window system
@@ -217,6 +227,8 @@ class Player:
     index: int = 0
     reference_index: int | None = None
     finished: bool = False
+    hold_only: bool = False
+    """Measurement mode: never plays, never advances by itself; only keys move it."""
 
     def advance(self) -> None:
         """Free-running step to the next frame (skipping the reference)."""
@@ -234,7 +246,8 @@ class Player:
         if key == "quit":
             self.finished = True
         elif key == "space":
-            self.paused = not self.paused
+            if not self.hold_only:
+                self.paused = not self.paused
         elif key in ("right", "down"):
             self.paused = True
             self.index = min(self.index + 1, self.n_items - 1)
@@ -372,11 +385,16 @@ def run(
     reference_ms: int = 0,
     session_extra: dict[str, Any] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    hold_only: bool = False,
 ) -> Player:
-    """Show ``items``; returns the final player state. The reference, if present, must be items[0]."""
+    """Show ``items``; returns the final player state. The reference, if present, must be items[0].
+
+    ``hold_only`` is measurement mode: starts paused, ignores play, never advances by itself.
+    """
     screen_w, screen_h = backend.open()
     ref_index = 0 if items and items[0].kind == "reference" else None
-    player = Player(len(items), paused=start_paused, loop=loop, reference_index=ref_index)
+    player = Player(len(items), paused=start_paused or hold_only, loop=loop and not hold_only,
+                    reference_index=ref_index, hold_only=hold_only)
     if ref_index is not None and not start_paused:
         player.index = 0  # the reference opens the session, then playback moves on
 
@@ -387,8 +405,9 @@ def run(
         "started": dt.datetime.now(dt.timezone.utc).isoformat(),
         "screen_px": [screen_w, screen_h],
         "surround_rgb": list(DISPLAY_SURROUND_RGB),
-        "interval_ms": interval_ms,
-        "reference_ms": reference_ms,
+        "measurement": hold_only,
+        "interval_ms": None if hold_only else interval_ms,
+        "reference_ms": None if hold_only else reference_ms,
         "scaling": "nearest-neighbour, integer only",
         "colour_management": "none (values written as stored)",
         **(session_extra or {}),
@@ -523,14 +542,18 @@ def _backend(args: argparse.Namespace) -> Backend:
     return OpenCVBackend(screen, windowed=args.windowed)
 
 
+#: Keystream domain of the pseudo-random payload `display frames --payload-bytes` encodes.
+RUN_PAYLOAD_DOMAIN = "run-payload"
+
+
 def cmd_frames(args: argparse.Namespace) -> None:
     params = CodecParams(colour_depth=args.colour_depth, cell_px=args.cell_px, seed=args.seed)
     if args.payload_file:
         payload = Path(args.payload_file).read_bytes()
         source = {"file": str(args.payload_file), "sha256": hashlib.sha256(payload).hexdigest()}
     else:
-        payload = keystream(params.seed, "run-payload", args.payload_bytes)
-        source = {"keystream": {"seed": params.seed, "domain": "run-payload", "bytes": args.payload_bytes}}
+        payload = keystream(params.seed, RUN_PAYLOAD_DOMAIN, args.payload_bytes)
+        source = {"keystream": {"seed": params.seed, "domain": RUN_PAYLOAD_DOMAIN, "bytes": args.payload_bytes}}
     frames = encode_frames(payload, params, n_frames=args.n_frames)
     out = Path(args.out)
     paths = save_frames([f.image for f in frames], out)
@@ -540,16 +563,24 @@ def cmd_frames(args: argparse.Namespace) -> None:
         "params_fingerprint": params.fingerprint(),
         "payload": {"length": len(payload), **source},
         "block_bytes": frame_capacity(params).block_bytes,
-        "frames": [{"file": p.name, "block_id": f.header.block_id, "image_sha256": image_sha256(f.image)} for p, f in zip(paths, frames, strict=True)],
+        "frames": [{"file": p.name, "block_id": f.header.block_id, "frame_index": f.frame_index,
+                    "image_sha256": image_sha256(f.image)} for p, f in zip(paths, frames, strict=True)],
     }
     (out / "frames.json").write_text(json.dumps(doc, indent=1) + "\n")
     print(f"wrote {len(paths)} frames and frames.json to {out}")
 
 
+DEMONSTRATOR_WARNING = (
+    "play is a DEMONSTRATOR, not a measurement path: frames advance on screen, so captures can tear between "
+    "frames. For measurement runs use `display measure experiments/runs/<run_id>.yaml`."
+)
+
+
 def cmd_play(args: argparse.Namespace) -> None:
+    print(f"WARNING: {DEMONSTRATOR_WARNING}", file=sys.stderr)
     directory = Path(args.directory)
     items = load_frames(directory)
-    extra: dict[str, Any] = {"source": str(directory)}
+    extra: dict[str, Any] = {"source": str(directory), "warning": DEMONSTRATOR_WARNING}
     meta = directory / "frames.json"
     if meta.exists():
         extra["frames_json"] = json.loads(meta.read_text())
@@ -559,6 +590,46 @@ def cmd_play(args: argparse.Namespace) -> None:
     log = DisplayLog(Path(args.log) if args.log else _default_log("play"))
     run(items, _backend(args), log, mode="play", interval_ms=args.interval_ms, start_paused=args.hold,
         loop=not args.once, scale=args.scale, reference_ms=args.reference_ms, session_extra=extra)
+    print(f"log: {log.path}")
+
+
+def measure_items(definition: Any) -> list[Item]:
+    """The measurement sequence for a run: reference, clip-check brightest, clip-check darkest, the run's frame."""
+    frame_px = definition.params.frame_px
+    items = [Item("reference (lock AE/AF/AWB)", np.asarray(reference_frame(frame_px)), "reference")]
+    for check in definition.clip_check:
+        image, _ = load_png(check.frames_dir / "frame_00000.png")
+        items.append(Item(f"clip check: {check.role} ({check.colour_depth} colours, {check.cell_px} px, "
+                          f"{check.stops_vs_reference:+.2f} stops)", image, "frame"))
+    image, chunks = load_png(definition.frames_dir / definition.frame.file)
+    if chunks:
+        print(f"warning: {definition.frame.file} carries {chunks}; ignored, values shown as stored", file=sys.stderr)
+    items.append(Item(f"RUN FRAME block {definition.frame.block_id} (index {definition.frame.frame_index}) - hold and capture",
+                      image, "frame"))
+    return items
+
+
+def cmd_measure(args: argparse.Namespace) -> None:
+    from prism_share.ingest.rundef import load_run_definition
+
+    path = Path(args.run_definition)
+    definition = load_run_definition(path.stem, path.parent)
+    items = measure_items(definition)
+    print("Measurement sequence (-> to step, <- to go back, r = reference, q = quit):")
+    for i, item in enumerate(items):
+        print(f"  {i}. {item.name}")
+    extra = {
+        "run_id": definition.run_id,
+        "run_definition": str(path),
+        "frames_dir": str(definition.frames_dir),
+        "block_id": definition.frame.block_id,
+        "frame_index": definition.frame.frame_index,
+        "params_label": definition.params.label,
+        "clip_check": [{"role": c.role, "colour_depth": c.colour_depth, "cell_px": c.cell_px,
+                        "stops_vs_reference": c.stops_vs_reference} for c in definition.clip_check],
+    }
+    log = DisplayLog(Path(args.log) if args.log else _default_log(f"measure_{definition.run_id}"))
+    run(items, _backend(args), log, mode="measure", scale=args.scale, session_extra=extra, hold_only=True, loop=False)
     print(f"log: {log.path}")
 
 
@@ -603,7 +674,13 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--out", required=True)
     f.set_defaults(func=cmd_frames)
 
-    p = sub.add_parser("play", help="show a directory of frame_*.png")
+    m = sub.add_parser("measure", help="MEASUREMENT: reference, clip checks, then hold the run's one frame")
+    m.add_argument("run_definition", help="experiments/runs/<run_id>.yaml")
+    m.add_argument("--scale", type=int, default=None, help="integer scale (default: largest that fits)")
+    window_options(m)
+    m.set_defaults(func=cmd_measure)
+
+    p = sub.add_parser("play", help="DEMONSTRATOR (not a measurement): show a directory of frame_*.png")
     p.add_argument("directory")
     p.add_argument("--hold", action="store_true", help="start paused (single-frame hold)")
     p.add_argument("--scale", type=int, default=None, help="integer scale (default: largest that fits)")
