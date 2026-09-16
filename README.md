@@ -982,19 +982,39 @@ decoder's under `sensitivity/`, and the footer labels each decoder
 ## Decode-benchmark bundle (Android spike)
 
 ```
-python -m prism_share.export.bench --out data/bench/ --frames 50
+python -m prism_share.export.bench --out data/bench/ --frames 50 \
+    --package io.github.ahmedov.prismshare.testspike
 ```
 
-This writes one folder per configuration in `BENCH_CONFIGURATIONS` (1 colour
-and 16 colours, both at 4 px). Each folder holds the ideal frames as PNG, byte
-for byte what `display frames` writes, plus `params.json` (flat `CodecParams`)
-and `ground_truth.json` (index band value, `glyph_ids` and `colour_ids` per
-frame). The bundle is meant for a second decoder in another language, so the
-JSON states every convention it depends on: the cell order rule with every
-cell's position, glyph bitmaps, palette and index band encoding.
-`tests/test_bench_export.py` rebuilds every frame from the JSON alone, so the
-description cannot drift from the code. `data/bench/README.md` gives the frame
-format version, payload bytes per frame and the `adb push` command.
+`--package` is the Android application ID of the app that reads the bundle. It is
+required and has no default, because the generated mkdir, push and chmod commands
+target that app's storage. An ID that does not parse is refused before anything
+is written.
+
+This bundle is for a Kotlin decoder in a separate project that cannot see this
+source. The benchmark measures decode compute, so the bundle carries everything
+as data and the consumer ports no layout logic.
+
+* **`manifest.json`** lists every configuration folder (`c1_px4`, `c16_px4`)
+  and every file in each, so the consumer enumerates instead of guessing.
+* **Each folder** holds the frames (1024×1024 lossless PNG, no degradation,
+  byte for byte what `display frames` writes), `params.json` (flat
+  `CodecParams`) and `ground_truth.json` (per frame: index band value, and
+  `glyph_ids` / `colour_ids` parallel to `cells`).
+* **`codec.json`** holds `glyphs` at rendered pixel size, `palette` in
+  encoder index order, `background`, and `cells` (x, y, width, height of every
+  data cell, in decode order). It also holds the other two things the decoder
+  reads, as rectangles: the `index_band` blocks, each with the bit it carries,
+  and the white/black `level_references` used to normalise levels.
+
+`tests/test_bench_export.py` acts as the consumer. Starting from
+`manifest.json`, it redraws every frame from the JSON alone and requires every
+cell, band block and reference pixel to match the PNG. `data/bench/README.md`
+gives the frame format version, payload bytes per frame, and the `adb push`
+commands, ending with `adb shell chmod -R o+rX` on the pushed folder. The chmod
+is required: `adb push` creates directories owned by `shell` in group
+`ext_data_rw`, which the app process is not in, so the app cannot read the
+pushed files until permissions are widened.
 
 ## Build plan
 

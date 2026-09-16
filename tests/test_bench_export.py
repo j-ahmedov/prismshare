@@ -1,9 +1,9 @@
-"""The decode-benchmark bundle: complete, self-describing, and identical to what display.py shows.
+"""The decode-benchmark bundle: complete as data, enumerable, and identical to what display.py shows.
 
-The core test reads ground_truth.json the way a second implementation would:
-it uses only the JSON and the PNG files, rebuilds the cell order from the
-written rule, redraws every cell and reads the index band from the written
-encoding. If the prose in the JSON and the code disagree, it fails.
+``test_consumer_redraws_every_frame_from_data_alone`` plays the Kotlin decoder.
+It starts from manifest.json and uses only the bundle's JSON and PNGs, with no
+layout rule, no formula and no import of the layout code. Every pixel it
+cannot account for from the data is a test failure.
 """
 
 from __future__ import annotations
@@ -18,145 +18,206 @@ from PIL import Image
 
 from prism_share.codec.decoder import read_index_band, read_symbols
 from prism_share.codec.framing import frame_capacity
+from prism_share.codec.layout import black_reference_mask, grid_layout, white_reference_mask
 from prism_share.codec.params import BENCH_CONFIGURATIONS, FRAME_FORMAT_VERSION, CodecParams
 from prism_share.export import bench
 from prism_share.transmit import display
 
 N_FRAMES = 2
+#: Deliberately not the capture app: the package must come from the argument, never a built-in default.
+PACKAGE = "org.example.bench_consumer2"
 
 
 @pytest.fixture(scope="module")
 def bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     out = tmp_path_factory.mktemp("bench") / "bench"
-    assert bench.main(["--out", str(out), "--frames", str(N_FRAMES)]) == 0
+    assert bench.main(["--out", str(out), "--frames", str(N_FRAMES), "--package", PACKAGE]) == 0
     return out
 
 
-def _folders(out: Path) -> list[Path]:
-    return [out / CodecParams(colour_depth=d, cell_px=c).label for d, c in BENCH_CONFIGURATIONS]
+def _manifest(out: Path) -> dict:
+    return json.loads((out / "manifest.json").read_text())
 
 
-def test_bundle_layout(bundle: Path) -> None:
-    assert BENCH_CONFIGURATIONS == ((1, 4), (16, 4))
-    for folder in _folders(bundle):
-        names = sorted(p.name for p in folder.iterdir())
-        assert names == [f"frame_{i:04d}.png" for i in range(N_FRAMES)] + ["ground_truth.json", "params.json"]
-    assert (bundle / "README.md").exists()
+def _load_png(path: Path) -> np.ndarray:
+    with Image.open(path) as im:
+        assert im.mode == "RGB"
+        return np.array(im)
+
+
+def test_manifest_enumerates_everything_and_nothing_else(bundle: Path) -> None:
+    m = _manifest(bundle)
+    assert m["frame_format_version"] == FRAME_FORMAT_VERSION and m["frames_per_configuration"] == N_FRAMES
+    assert [(c["colour_depth"], c["cell_px"]) for c in m["configurations"]] == list(BENCH_CONFIGURATIONS) == [(1, 4), (16, 4)]
+    assert [c["folder"] for c in m["configurations"]] == ["c1_px4", "c16_px4"]
+    assert sorted(p.name for p in bundle.iterdir()) == sorted(["manifest.json", "README.md", "c1_px4", "c16_px4"])
+    for c in m["configurations"]:
+        listed = {c["params"], c["codec"], c["ground_truth"], *c["frames"]}
+        assert {p.name for p in (bundle / c["folder"]).iterdir()} == listed
+        assert c["frames"] == [f"frame_{i:04d}.png" for i in range(N_FRAMES)]
+        params = CodecParams(colour_depth=c["colour_depth"], cell_px=c["cell_px"])
+        assert c["payload_bytes_per_frame"] == frame_capacity(params).block_bytes
+        assert c["params_fingerprint"] == params.fingerprint()
 
 
 def test_params_json_is_the_flat_codec_params(bundle: Path) -> None:
-    for (depth, cell), folder in zip(BENCH_CONFIGURATIONS, _folders(bundle), strict=True):
-        doc = json.loads((folder / "params.json").read_text())
-        assert all(not isinstance(v, dict | list) for v in doc.values())
-        assert CodecParams.from_dict(doc) == CodecParams(colour_depth=depth, cell_px=cell)
+    for c in _manifest(bundle)["configurations"]:
+        doc = json.loads((bundle / c["folder"] / c["params"]).read_text())
+        assert all(isinstance(v, int) for v in doc.values())
+        assert CodecParams.from_dict(doc) == CodecParams(colour_depth=c["colour_depth"], cell_px=c["cell_px"])
 
 
-def _cells_from_rule(order: dict) -> tuple[list[int], list[int]]:
-    """Re-derive the cell order from the prose fields only."""
-    g = order["grid"]
-    gap, n = g["cell_gap_px"], g["cell_px"]
-    xs, ys = [], []
-    for row in range(g["cells_per_side"]):
-        for col in range(g["cells_per_side"]):
-            x, y = g["origin_px"] + col * g["pitch_px"], g["origin_px"] + row * g["pitch_px"]
-            if not any(x - gap < r["x"] + r["width"] and x + n + gap > r["x"] and y - gap < r["y"] + r["height"] and y + n + gap > r["y"]
-                       for r in order["reserved_rectangles"]):
-                xs.append(x)
-                ys.append(y)
-    return xs, ys
+def test_consumer_redraws_every_frame_from_data_alone(bundle: Path) -> None:
+    m = _manifest(bundle)
+    for c in m["configurations"]:
+        folder = bundle / c["folder"]
+        codec = json.loads((folder / c["codec"]).read_text())
+        truth = json.loads((folder / c["ground_truth"]).read_text())
+        glyphs = np.array(codec["glyphs"], dtype=np.uint8)
+        palette = np.array(codec["palette"], dtype=np.uint8)
+        background = np.array(codec["background"], dtype=np.uint8)
+        cells = codec["cells"]
+        assert len(glyphs) == codec["glyph_count"] == 16 and len(palette) == codec["colour_depth"] == c["colour_depth"]
+        assert all(cell["width"] == cell["height"] == glyphs.shape[1] == glyphs.shape[2] == c["cell_px"] for cell in cells)
+        assert (glyphs.reshape(len(glyphs), -1).sum(axis=1) == codec["glyph_ink_pixels"]).all()
+        assert len(cells) == codec["n_cells"] == c["n_cells"]
+        assert [f["file"] for f in truth["frames"]] == c["frames"]
 
-
-def test_second_implementation_rebuilds_every_frame_from_the_json(bundle: Path) -> None:
-    static: np.ndarray | None = None
-    for folder in _folders(bundle):
-        gt = json.loads((folder / "ground_truth.json").read_text())
-        assert gt["frame_format_version"] == FRAME_FORMAT_VERSION
-        order, book, band = gt["cell_order"], gt["codebook"], gt["index_band"]
-        n = order["grid"]["cell_px"]
-
-        xs, ys = _cells_from_rule(order)
-        assert xs == order["cell_x"] and ys == order["cell_y"] and len(xs) == gt["symbols"]["n_cells"]
-
-        glyphs = np.array(book["glyphs"], dtype=np.uint8)
-        palette = np.array(book["palette_rgb"], dtype=np.uint8)
-        background = np.array(book["background_rgb"], dtype=np.uint8)
-        assert len(gt["frames"]) == N_FRAMES
-        for k, frame in enumerate(gt["frames"]):
-            path = folder / frame["file"]
-            assert frame["file"] == f"frame_{k:04d}.png"
+        for name, frame in zip(c["frames"], truth["frames"], strict=True):
+            path = folder / name
             assert hashlib.sha256(path.read_bytes()).hexdigest() == frame["png_sha256"]
-            with Image.open(path) as im:
-                assert im.mode == "RGB" and im.size == (gt["image"]["width"], gt["image"]["height"])
-                img = np.array(im)
-            covered = np.zeros(img.shape[:2], dtype=bool)
+            img = _load_png(path)
+            assert img.shape == (m["frame_height"], m["frame_width"], 3)
+            covered = np.zeros(img.shape[:2], dtype=np.uint8)
 
-            # Cells: redraw each from glyph_ids / colour_ids and the codebook.
             gids, cids = frame["glyph_ids"], frame["colour_ids"]
-            assert len(gids) == len(cids) == len(xs)
-            for i, (x, y) in enumerate(zip(xs, ys, strict=True)):
+            assert len(gids) == len(cids) == len(cells)
+            for i, cell in enumerate(cells):
+                x, y, w, h = cell["x"], cell["y"], cell["width"], cell["height"]
                 expected = np.where(glyphs[gids[i]][:, :, None] == 1, palette[cids[i]], background)
-                assert np.array_equal(img[y : y + n, x : x + n], expected), (folder.name, k, i)
-                covered[y : y + n, x : x + n] = True
+                assert np.array_equal(img[y : y + h, x : x + w], expected), (c["folder"], name, i)
+                covered[y : y + h, x : x + w] += 1
 
-            # Index band: bit of block p is bit (bits - 1 - p mod bits) of the value, white = 1.
-            value = frame["index_band"]
-            assert value == k + 1 and frame["header"]["block_id"] == k
-            for p in range(band["blocks"]):
-                bit = (value >> (band["bits"] - 1 - p % band["bits"])) & 1
-                x0, y0, b = band["x"] + p * band["block_px"], band["y"], band["block_px"]
-                assert np.all(img[y0 : y0 + b, x0 : x0 + b] == (255 if bit else 0)), (folder.name, k, p)
-                covered[y0 : y0 + b, x0 : x0 + b] = True
+            band = codec["index_band"]
+            assert len(band["blocks"]) == band["bits"] * band["repeats"]
+            for block in band["blocks"]:
+                x, y, w, h = block["x"], block["y"], block["width"], block["height"]
+                bit = (frame["index_band"] >> block["bit"]) & 1
+                assert np.all(img[y : y + h, x : x + w] == (255 if bit else 0)), (c["folder"], name, block)
+                covered[y : y + h, x : x + w] += 1
 
-            # Everything else is the same static region in every frame of every configuration.
-            rest = np.where(covered[:, :, None], 0, img)
-            if static is None:
-                static = rest
-            assert np.array_equal(rest, static)
+            refs = codec["level_references"]
+            for level, value in (("white", 255), ("black", 0)):
+                for r in refs[level]:
+                    assert np.all(img[r["y"] : r["y"] + r["height"], r["x"] : r["x"] + r["width"]] == value), (level, r)
+                    covered[r["y"] : r["y"] + r["height"], r["x"] : r["x"] + r["width"]] += 1
+            assert covered.max() == 1  # cells, band blocks and references never overlap one another
 
 
-def test_ground_truth_matches_the_decoder(bundle: Path) -> None:
-    for (depth, cell), folder in zip(BENCH_CONFIGURATIONS, _folders(bundle), strict=True):
-        params = CodecParams(colour_depth=depth, cell_px=cell)
-        gt = json.loads((folder / "ground_truth.json").read_text())
-        for frame in gt["frames"]:
-            with Image.open(folder / frame["file"]) as im:
-                img = np.array(im)
+def test_cells_are_the_decoders_cells_in_the_decoders_order(bundle: Path) -> None:
+    for c in _manifest(bundle)["configurations"]:
+        params = CodecParams(colour_depth=c["colour_depth"], cell_px=c["cell_px"])
+        folder = bundle / c["folder"]
+        codec = json.loads((folder / c["codec"]).read_text())
+        layout = grid_layout(params)
+        assert [(cell["x"], cell["y"]) for cell in codec["cells"]] == list(zip(layout.cell_x.tolist(), layout.cell_y.tolist(), strict=True))
+        truth = json.loads((folder / c["ground_truth"]).read_text())
+        for frame in truth["frames"]:
+            img = _load_png(folder / frame["file"])
             readout = read_symbols(img, params)
             assert readout.glyphs.tolist() == frame["glyph_ids"] and readout.colours.tolist() == frame["colour_ids"]
             assert read_index_band(img, params).index == frame["index_band"]
 
 
+def test_level_reference_rectangles_are_exactly_the_decoders_masks(bundle: Path) -> None:
+    c = _manifest(bundle)["configurations"][0]
+    codec = json.loads((bundle / c["folder"] / c["codec"]).read_text())
+    for level, mask in (("white", white_reference_mask(codec["frame_width"])), ("black", black_reference_mask(codec["frame_width"]))):
+        drawn = np.zeros(mask.shape, dtype=np.uint8)
+        for r in codec["level_references"][level]:
+            drawn[r["y"] : r["y"] + r["height"], r["x"] : r["x"] + r["width"]] += 1
+        assert drawn.max() == 1 and np.array_equal(drawn.astype(bool), mask)
+
+
+def test_mask_rectangles_is_an_exact_disjoint_cover() -> None:
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        mask = rng.random((13, 17)) < 0.4
+        mask[3:9, 2:12] = True
+        drawn = np.zeros(mask.shape, dtype=np.uint8)
+        for r in bench.mask_rectangles(mask):
+            drawn[r["y"] : r["y"] + r["height"], r["x"] : r["x"] + r["width"]] += 1
+        assert drawn.max() <= 1 and np.array_equal(drawn.astype(bool), mask)
+
+
 def test_frames_are_exactly_what_display_frames_writes(bundle: Path, tmp_path: Path) -> None:
-    for (depth, cell), folder in zip(BENCH_CONFIGURATIONS, _folders(bundle), strict=True):
-        params = CodecParams(colour_depth=depth, cell_px=cell)
-        out = tmp_path / params.label
-        display.main(["frames", "--colour-depth", str(depth), "--cell-px", str(cell), "--out", str(out),
+    for c in _manifest(bundle)["configurations"]:
+        params = CodecParams(colour_depth=c["colour_depth"], cell_px=c["cell_px"])
+        out = tmp_path / c["folder"]
+        display.main(["frames", "--colour-depth", str(params.colour_depth), "--cell-px", str(params.cell_px), "--out", str(out),
                       "--payload-bytes", str(N_FRAMES * frame_capacity(params).block_bytes), "--n-frames", str(N_FRAMES)])
         shown = sorted(out.glob("frame_*.png"))
         assert len(shown) == N_FRAMES
-        for i, path in enumerate(shown):
-            assert path.read_bytes() == (folder / f"frame_{i:04d}.png").read_bytes()
+        for path, name in zip(shown, c["frames"], strict=True):
+            assert path.read_bytes() == (bundle / c["folder"] / name).read_bytes()
 
 
-def test_readme_states_version_payload_and_adb_command(bundle: Path) -> None:
+def test_readme_states_version_payload_and_adb_commands(bundle: Path) -> None:
     text = (bundle / "README.md").read_text()
-    assert f"**Frame format version:** {FRAME_FORMAT_VERSION}" in text
-    for depth, cell in BENCH_CONFIGURATIONS:
-        params = CodecParams(colour_depth=depth, cell_px=cell)
-        assert f"| `{params.label}` |" in text and f"**{frame_capacity(params).block_bytes}**" in text
-    phone = "/sdcard/Android/data/io.github.ahmedov.prismshare.capture/files/bench"
-    assert f"adb shell mkdir -p {phone}\n" in text
-    push = next(line for line in text.splitlines() if line.startswith("adb push "))
-    assert push.endswith(f" {phone}/") and all(f.name in push for f in _folders(bundle))
+    assert f"**Frame format version: {FRAME_FORMAT_VERSION}.**" in text
+    for c in _manifest(bundle)["configurations"]:
+        assert f"| `{c['folder']}` |" in text and f"**{c['payload_bytes_per_frame']}** |" in text
+    phone = f"/sdcard/Android/data/{PACKAGE}/files/bench"
+    lines = text.splitlines()
+    assert "prismshare.capture/" not in text and "prismshare.testspike" not in text  # no package but the one given
+    assert f"--package {PACKAGE}`" in text  # the regeneration command reproduces it
+    assert f"adb shell mkdir -p {phone}" in lines
+    push = next(line for line in lines if line.startswith("adb push "))
+    for name in ("manifest.json", "README.md", "c1_px4", "c16_px4"):
+        assert f"{bundle.as_posix()}/{name} " in push
+    assert push.endswith(f" {phone}/")
+    # The chmod is generated, not hand-added, and comes after the push, with its reason.
+    chmod = f"adb shell chmod -R o+rX {phone}"
+    assert chmod in lines and lines.index(chmod) == lines.index(push) + 1
+    assert "`ext_data_rw`" in text and "not in `ext_data_rw`" in text and "unreadable to the app" in text
+    commands = [line for line in lines if line.startswith("adb ")]
+    assert len(commands) == 3 and all(f"/sdcard/Android/data/{PACKAGE}/files/bench" in line for line in commands)
 
 
-def test_refuses_to_mix_into_an_existing_bundle(bundle: Path) -> None:
+def test_package_is_required(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        bench.main(["--out", str(tmp_path / "b"), "--frames", "1"])
+    assert exc.value.code == 2 and "--package" in capsys.readouterr().err
+    assert not (tmp_path / "b").exists()
+
+
+@pytest.mark.parametrize("bad", [
+    "", "testspike", "io.github.ahmedov.prismshare.", ".io.github", "io..github", "io.1github", "io.github-ahmedov",
+    "io.github.ahmedov/prismshare", "io.github ahmedov", "io.github.ahmedov.prismshare.testspike\n", "_io.github",
+    "io.github.é",
+])
+def test_invalid_application_ids_are_refused_before_writing(tmp_path: Path, bad: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(ValueError, match="Android application ID"):
+        bench.validate_package(bad)
+    out = tmp_path / "b"
+    assert bench.main(["--out", str(out), "--frames", "1", "--package", bad]) == 2
+    assert "Android application ID" in capsys.readouterr().err
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("good", ["io.github.ahmedov.prismshare.testspike", "a.b", "com.Example_1.app2", "x.y_.Z9"])
+def test_valid_application_ids_are_accepted(good: str) -> None:
+    assert bench.validate_package(good) == good
+    assert bench.phone_bench_dir(good) == f"/sdcard/Android/data/{good}/files/bench"
+
+
+def test_refuses_to_write_over_an_existing_bundle(bundle: Path) -> None:
     with pytest.raises(FileExistsError):
-        bench.export(bundle, N_FRAMES)
-    assert bench.main(["--out", str(bundle), "--frames", "1"]) == 2
+        bench.export(bundle, N_FRAMES, PACKAGE)
+    assert bench.main(["--out", str(bundle), "--frames", "1", "--package", PACKAGE]) == 2
 
 
-def test_frame_count_must_give_distinct_band_values(tmp_path: Path) -> None:
+def test_frame_count_must_give_distinct_band_values() -> None:
     for bad in (0, 256):
         with pytest.raises(ValueError):
             bench.bench_frames(CodecParams(colour_depth=1, cell_px=10), bad)
